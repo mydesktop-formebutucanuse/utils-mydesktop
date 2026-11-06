@@ -1,0 +1,10 @@
+[package]
+name = "mediakeyd"
+version = "0.1.0"
+description = "Run commands for media keys without grabbing them (XInput2 raw key events)"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies: libX11 and libXi are called directly (src/xlib.rs).

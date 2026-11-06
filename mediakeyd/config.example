@@ -13,7 +13,7 @@ XF86AudioLowerVolume   repeat  wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
 XF86AudioMute          once    wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 
 # Screen brightness and keyboard backlight (elogind, no root).
-# backlight is contrib/backlight, installed to ~/.local/bin.
+# backlight is backlight/backlight of utils-mydesktop, installed to ~/.local/bin.
 XF86MonBrightnessUp    repeat  $HOME/.local/bin/backlight screen +5
 XF86MonBrightnessDown  repeat  $HOME/.local/bin/backlight screen -5
 XF86KbdBrightnessUp    repeat  $HOME/.local/bin/backlight kbd +10

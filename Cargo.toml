@@ -1,13 +1,11 @@
-[package]
-name = "mediakeyd"
-version = "0.1.0"
-edition = "2024"
-description = "Run commands for media keys without grabbing them (XInput2 raw key events)"
-license = "GPL-3.0-or-later"
-repository = "https://github.com/mydesktop-formebutucanuse/mediakeyd"
-readme = "README.md"
+[workspace]
+members = ["mediakeyd"]
+resolver = "3"
 
-# No dependencies: libX11 and libXi are called directly (src/xlib.rs).
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/mydesktop-formebutucanuse/utils-mydesktop"
 
 [profile.release]
 opt-level = "s"
