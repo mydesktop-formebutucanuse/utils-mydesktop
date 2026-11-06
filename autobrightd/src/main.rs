@@ -4,7 +4,7 @@
 //! ambient light sensor and steps aside when someone else changes them.
 //!
 //! It wakes 5 times a second while nothing changes (the sensor reports every
-//! 200 ms), and about 21 times a second while a change runs. Manual
+//! 200 ms), and about 60 times a second while a change runs. Manual
 //! screen changes are noticed through sysfs_notify() on actual_brightness,
 //! and plugging or unplugging the charger through kernel uevents.
 
@@ -18,12 +18,14 @@ macro_rules! say {
     }};
 }
 
+mod calibrate;
 mod logic;
 mod sys;
 
 use logic::{Channel, LuxFilter, Settings, Update};
 use std::path::Path;
 use std::process::exit;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use sys::{Attr, KeyEvent, KeySignals, Uevents};
 
@@ -47,9 +49,11 @@ const SAMPLE: Duration = Duration::from_millis(200);
 /// While the panel is off, only DPMS is checked, this often.
 const DPMS_OFF_CHECK: Duration = Duration::from_secs(1);
 
-const USAGE: &str = "usage: autobrightd [-v] [-n]
-  -v  print what it does
-  -n  dry run: read the sensor and print, but write nothing";
+const USAGE: &str = "usage: autobrightd [-v] [-n] | --calibrate
+  -v           print what it does
+  -n           dry run: read the sensor and print, but write nothing
+  --calibrate  measure how the panel follows the brightness written (about
+               70 s; autobrightd must not run) and save it for later runs";
 
 struct Backlight {
     channel: Channel,
@@ -119,7 +123,11 @@ impl Daemon {
             max: screen_max,
             dead_zone: (screen_max as f32 * logic::SCREEN_DEAD_PCT / 100.0) as u32,
         };
-        let screen = open_backlight("screen", SCREEN_DIR, screen_settings, write)?;
+        let mut screen = open_backlight("screen", SCREEN_DIR, screen_settings, write)?;
+        match calibrate::load(screen_max) {
+            Ok(map) => screen.channel.map = map.map(Rc::new),
+            Err(e) => say!("autobrightd: panel map: {e}"),
+        }
         let screen_notify = Attr::open(Path::new(SCREEN_DIR).join("actual_brightness"), false).ok();
         // Read once so the notification is armed.
         if let Some(n) = &screen_notify {
@@ -164,6 +172,10 @@ impl Daemon {
             let path = |a: &Option<Attr>| a.as_ref().map_or("(none)".into(), |a| a.path.display().to_string());
             say!("autobrightd: als {}", d.als.path.display());
             say!("autobrightd: screen {} max {}", d.screen.attr.path.display(), d.screen.channel.settings.max);
+            match &d.screen.channel.map {
+                Some(map) => say!("autobrightd: panel map: {} points", map.len()),
+                None => say!("autobrightd: no panel map (autobrightd --calibrate makes one)"),
+            }
             match &d.kbd {
                 Some(k) => say!("autobrightd: kbd {} max {}", k.attr.path.display(), k.channel.settings.max),
                 None => say!("autobrightd: kbd (none)"),
@@ -428,10 +440,12 @@ enum Which {
 fn main() {
     let mut verbose = false;
     let mut dry_run = false;
+    let mut calibrate = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-v" => verbose = true,
             "-n" => dry_run = true,
+            "--calibrate" => calibrate = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -451,6 +465,14 @@ fn main() {
             None
         }
     };
+    if calibrate {
+        // The key handlers stay in, so a brightness key does not end it.
+        if let Err(e) = calibrate::run(Path::new(SCREEN_DIR)) {
+            say!("autobrightd: {e}");
+            exit(1);
+        }
+        return;
+    }
     match Daemon::open(verbose, dry_run, keys) {
         Ok(mut d) => d.run(),
         Err(e) => {

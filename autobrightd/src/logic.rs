@@ -6,6 +6,7 @@
 //! (Craig Hughes) and juicecultus/asahi-auto-brightness. Their MIT notice,
 //! which has to stay with copies of that work, is in NOTICE.
 
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Points of lux → percent of max_brightness, joined by straight lines.
@@ -55,17 +56,6 @@ pub struct Motion {
     pub accel: f32,
 }
 
-impl Motion {
-    /// This motion, sped up if needed so that `dist` (ln units) takes at
-    /// most `secs`, speeding up and slowing down included. The time it
-    /// takes to reach top speed stays the same.
-    pub fn within(self, dist: f32, secs: f32) -> Motion {
-        let ease = self.speed / self.accel;
-        let speed = self.speed.max(dist / (secs - ease).max(0.1));
-        Motion { speed, accel: speed / ease }
-    }
-}
-
 /// Brightness changes are measured as ratios of (brightness + this much of
 /// the maximum). Pure ratios would make the bottom of the range endless:
 /// from 1/64 nit to 2 nits is as far as from 4 to 500. But the eye needs
@@ -74,19 +64,17 @@ impl Motion {
 /// dark end is compressed. 3 % is 15 nits on a 500-nit screen.
 pub const DARK_PCT: f32 = 3.0;
 
-/// The screen moves at most 11 % per second: about 0.19 % per write at 60
-/// writes a second (the kernel patches), 0.54 % at the 21 the DCP driver
-/// takes without them. Around 20 Hz the eye picks up a brightness step of
-/// roughly 1 % on a large bright field: 1 % steps did show. Top speed is
-/// reached, and given up, over 0.75 s. A small change takes about 0.75 s,
-/// 140 to 315 nits about 7.5 s, 25 % to 100 % about 12.5 s, and the lowest
-/// setting to 25 % about 20 s, but see MAX_CHANGE.
-pub const SCREEN_MOTION: Motion = Motion { speed: 0.1125, accel: 0.1125 / 0.75 };
-/// No automatic change takes longer than this many seconds: one that would
-/// goes faster. A full swing (125 to 500 nits) then takes 8 s instead of
-/// 12, the lowest setting to 25 % 8 s instead of 20; smaller changes are as
-/// above.
-pub const MAX_CHANGE: f32 = 8.0;
+/// From the lowest level that shows to the maximum is ln(1.03 / 0.034) =
+/// 3.41 in this space (dead zone 0.4 %, dark offset 3 %), whatever the
+/// maximum.
+pub const FULL_RANGE: f32 = 3.41;
+/// The screen goes from its lowest level to the maximum in about 8 s: top
+/// speed 0.47 a second, reached and given up over 0.75 s, about 0.8 % per
+/// write at 60 writes a second (2.2 % at the 21 the DCP driver takes
+/// without the kernel patches). Every change goes at this speed, so a new
+/// target during a change never makes it slow down. 140 to 315 nits takes
+/// about 2.4 s, a small change about 0.35 s.
+pub const SCREEN_MOTION: Motion = Motion { speed: FULL_RANGE / 7.25, accel: FULL_RANGE / 7.25 / 0.75 };
 /// Nobody watches the keyboard fade, and from off every unit is a large
 /// ratio, so it moves much faster: off to 75 % in about 2 s.
 pub const KBD_MOTION: Motion = Motion { speed: 2.0, accel: 4.0 };
@@ -194,9 +182,81 @@ impl LuxFilter {
     }
 }
 
+/// How the brightness the panel shows follows the value written. The Apple
+/// panel does not follow the driver's nits evenly: measured on an M1 Pro
+/// through what the DCP reports (actual_brightness), it rises 1.4 times as
+/// fast as the written value just above about 130 and 255 nits, and 0.7
+/// times as fast near the top, so an even change of the written value
+/// lurches there. `autobrightd --calibrate` measures the panel; changes then
+/// move evenly in what the panel shows. Points (written, shown) in device
+/// units, both rising, joined by straight lines; outside them, the offset
+/// of the nearest point.
+#[derive(Debug)]
+pub struct PanelMap {
+    shown: Vec<(f32, f32)>,
+    written: Vec<(f32, f32)>,
+}
+
+/// y at `x` on the line through `points` (x, y), x rising.
+fn through(points: &[(f32, f32)], x: f32) -> f32 {
+    let i = points.partition_point(|p| p.0 < x);
+    if i == 0 || i == points.len() {
+        let p = points[i.min(points.len() - 1)];
+        return x + p.1 - p.0;
+    }
+    let (a, b) = (points[i - 1], points[i]);
+    a.1 + (x - a.0) * (b.1 - a.1) / (b.0 - a.0)
+}
+
+impl PanelMap {
+    /// From measured (written, shown) points; drops any that do not rise in
+    /// both. None if fewer than two are left.
+    pub fn new(mut points: Vec<(f32, f32)>) -> Option<PanelMap> {
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut shown: Vec<(f32, f32)> = Vec::new();
+        for p in points {
+            if shown.last().is_none_or(|l| p.0 > l.0 && p.1 > l.1) {
+                shown.push(p);
+            }
+        }
+        let written = shown.iter().map(|&(w, s)| (s, w)).collect();
+        (shown.len() >= 2).then_some(PanelMap { shown, written })
+    }
+
+    pub fn len(&self) -> usize {
+        self.shown.len()
+    }
+
+    /// The (written, shown) points.
+    pub fn points(&self) -> &[(f32, f32)] {
+        &self.shown
+    }
+
+    /// What the panel shows for a written value.
+    pub fn shown(&self, written: f32) -> f32 {
+        through(&self.shown, written)
+    }
+
+    /// The value to write for the panel to show `shown`.
+    pub fn written(&self, shown: f32) -> f32 {
+        through(&self.written, shown)
+    }
+}
+
+/// What the panel shows for a written value, with or without a map.
+fn shown(map: Option<&Rc<PanelMap>>, written: f32) -> f32 {
+    map.map_or(written, |m| m.shown(written))
+}
+
+/// The value to write for the panel to show `x`, with or without a map.
+fn written(map: Option<&Rc<PanelMap>>, x: f32) -> f32 {
+    map.map_or(x, |m| m.written(x))
+}
+
 /// A running change: where the brightness is and how fast it moves, in
-/// ln(units + dark offset), heading for `to` within the channel's Motion
-/// limits. It
+/// ln(shown units + dark offset), heading for `to` within the channel's
+/// Motion limits. Shown units are what the panel shows (PanelMap), or the
+/// written value without a map. It
 /// speeds up and slows down gently and never overshoots. A new target only
 /// changes where it heads: the speed carries on, and a change that has to
 /// turn around slows down first.
@@ -211,6 +271,7 @@ pub struct Ramp {
     pub by_key: bool,
     /// The dark offset in units (DARK_PCT of the maximum).
     off: f32,
+    map: Option<Rc<PanelMap>>,
     pos: f32,
     speed: f32,
     last: Instant,
@@ -223,12 +284,22 @@ fn dark_offset(s: &Settings) -> f32 {
 }
 
 impl Ramp {
-    pub fn new(from: u32, to: u32, s: &Settings, motion: Motion, now: Instant) -> Ramp {
+    pub fn new(from: u32, to: u32, s: &Settings, motion: Motion, map: Option<Rc<PanelMap>>, now: Instant) -> Ramp {
         let off = dark_offset(s);
         // Below the dead zone nothing shows; start rising at its top.
         let from = if from < s.dead_zone && to > s.dead_zone { s.dead_zone } else { from };
-        let pos = (from as f32 + off).ln();
-        Ramp { to, motion, by_key: false, off, pos, speed: 0.0, last: now, next_at: now }
+        let pos = (shown(map.as_ref(), from as f32) + off).ln();
+        Ramp { to, motion, by_key: false, off, map, pos, speed: 0.0, last: now, next_at: now }
+    }
+
+    /// A written value as a position (ln units).
+    fn at(&self, value: u32) -> f32 {
+        (shown(self.map.as_ref(), value as f32) + self.off).ln()
+    }
+
+    /// The nearest written value to a position.
+    fn value(&self, x: f32) -> u32 {
+        written(self.map.as_ref(), x.exp() - self.off).round().max(0.0) as u32
     }
 
     /// Current speed, in ln units per second.
@@ -239,12 +310,7 @@ impl Ramp {
 
     /// The target in ln units.
     fn target(&self) -> f32 {
-        (self.to as f32 + self.off).ln()
-    }
-
-    /// How far the target is, in ln units.
-    fn distance(&self) -> f32 {
-        (self.target() - self.pos).abs()
+        self.at(self.to)
     }
 
     /// Where it would come to rest if it started slowing down now.
@@ -254,7 +320,7 @@ impl Ramp {
 
     /// Heads for `x` (ln units), the nearest whole value.
     fn head_for(&mut self, x: f32) {
-        self.to = (x.exp() - self.off).round().max(0.0) as u32;
+        self.to = self.value(x);
     }
 
     /// Moves on to `now`. Returns the whole value there, and whether the
@@ -264,7 +330,7 @@ impl Ramp {
         // A long gap (a suspend, say) must not turn into one big step.
         let dt = now.saturating_duration_since(self.last).as_secs_f32().min(0.25);
         self.last = now;
-        let target = (self.to as f32 + self.off).ln();
+        let target = self.target();
         let dist = target - self.pos;
         let dir = dist.signum();
         // As fast as allowed, but no faster than it can still stop in time.
@@ -277,7 +343,7 @@ impl Ramp {
             return (self.to, true);
         }
         self.pos = pos;
-        ((pos.exp() - self.off).round().max(0.0) as u32, false)
+        (self.value(pos), false)
     }
 }
 
@@ -294,6 +360,8 @@ pub struct Channel {
     pub override_lux: Option<f32>,
     /// A brightness key that is down.
     key: Option<KeyHold>,
+    /// How the panel follows the written value, if measured.
+    pub map: Option<Rc<PanelMap>>,
 }
 
 /// A brightness key that is down. The brightness moves on in its direction
@@ -320,7 +388,7 @@ pub enum Update {
 
 impl Channel {
     pub fn new(name: &'static str, settings: Settings, current: u32) -> Channel {
-        Channel { name, settings, known: current, target: current, ramp: None, override_lux: None, key: None }
+        Channel { name, settings, known: current, target: current, ramp: None, override_lux: None, key: None, map: None }
     }
 
     /// A value read back from the brightness file. Returns true when someone
@@ -355,15 +423,15 @@ impl Channel {
     }
 
     /// Starts or redirects an automatic change toward `to`. Only where it
-    /// heads changes; position, speed and beat stay. It may go faster than
-    /// the channel's motion so as to take at most MAX_CHANGE.
+    /// heads changes; position, speed and beat stay.
     pub fn head_for(&mut self, to: u32, now: Instant) {
         self.target = to;
         self.key = None;
-        let ramp = self.ramp.get_or_insert_with(|| Ramp::new(self.known, to, &self.settings, self.settings.motion, now));
+        let (s, map) = (&self.settings, &self.map);
+        let ramp = self.ramp.get_or_insert_with(|| Ramp::new(self.known, to, s, s.motion, map.clone(), now));
         ramp.to = to;
         ramp.by_key = false;
-        ramp.motion = self.settings.motion.within(ramp.distance(), MAX_CHANGE);
+        ramp.motion = self.settings.motion;
     }
 
     /// When the next write is due, if a change is running.
@@ -392,9 +460,13 @@ impl Channel {
     /// from the lowest level that shows (the top of the dead zone) to the
     /// maximum.
     fn key_range(&self) -> (f32, f32) {
-        let off = dark_offset(&self.settings);
         let lowest = self.settings.dead_zone.max(1);
-        ((lowest as f32 + off).ln(), (self.settings.max as f32 + off).ln())
+        (self.at(lowest), self.at(self.settings.max))
+    }
+
+    /// A written value as a position (ln of shown units + dark offset).
+    fn at(&self, value: u32) -> f32 {
+        (shown(self.map.as_ref(), value as f32) + dark_offset(&self.settings)).ln()
     }
 
     /// Brightness keys: `presses` steps up (+) or down (-). A step is
@@ -410,16 +482,15 @@ impl Channel {
             hold.last = now;
             return self.target;
         }
-        let off = dark_offset(&self.settings);
         let lowest = self.settings.dead_zone.max(1);
         let (lo, hi) = self.key_range();
         let step = (hi - lo) / KEY_STEPS;
         let (pos, base) = match &self.ramp {
             // Presses during a key glide add up from where it heads.
-            Some(r) if r.by_key => (r.pos, (r.to as f32 + off).ln()),
+            Some(r) if r.by_key => (r.pos, r.target()),
             Some(r) => (r.pos, r.pos),
             None => {
-                let x = (self.known.max(lowest) as f32 + off).ln();
+                let x = self.at(self.known.max(lowest));
                 (x, x)
             }
         };
@@ -429,12 +500,14 @@ impl Channel {
         let to = if want >= hi - 1e-4 {
             self.settings.max
         } else {
-            ((want.exp() - off).round() as u32).clamp(lowest, self.settings.max)
+            let x = written(self.map.as_ref(), want.exp() - dark_offset(&self.settings));
+            (x.round().max(0.0) as u32).clamp(lowest, self.settings.max)
         };
         self.target = to;
         self.override_lux = Some(lux);
         self.key = Some(KeyHold { dir, min_to: want, last: now });
-        let ramp = self.ramp.get_or_insert_with(|| Ramp::new(self.known, to, &self.settings, KEY_MOTION, now));
+        let (s, map) = (&self.settings, &self.map);
+        let ramp = self.ramp.get_or_insert_with(|| Ramp::new(self.known, to, s, KEY_MOTION, map.clone(), now));
         ramp.to = to;
         ramp.motion = KEY_MOTION;
         ramp.by_key = true;
@@ -562,7 +635,7 @@ mod tests {
 
     fn start_change(ch: &mut Channel, to: u32, t: Instant) {
         ch.target = to;
-        ch.ramp = Some(Ramp::new(ch.known, to, &ch.settings, ch.settings.motion, t));
+        ch.ramp = Some(Ramp::new(ch.known, to, &ch.settings, ch.settings.motion, ch.map.clone(), t));
     }
 
     /// Runs frames as the daemon would until `until`; returns the writes.
@@ -635,69 +708,45 @@ mod tests {
         assert!(y > 100.0, "{y}");
     }
 
-    /// Largest written step allowed on the screen, in percent: 0.2 % plus
-    /// rounding to whole 1/64-nit units (0.0125 % at 125 nits).
-    const MAX_PCT: f32 = 0.22;
+    /// Largest written step of an automatic change, in percent: 0.75 % at
+    /// top speed in the motion space (writes 16 ms apart here), a little
+    /// more in plain ratios (+ 15 nits of dark offset), plus rounding.
+    const MAX_PCT: f32 = 1.0;
 
     #[test]
-    fn screen_steps_stay_under_0_2_percent() {
+    fn screen_steps_stay_under_1_percent() {
         let t = Instant::now();
         let mut ch = screen(nits(140));
         start_change(&mut ch, nits(315), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
         let (last_t, last_v) = *w.last().unwrap();
         assert_eq!(last_v, nits(315));
-        assert!(last_t > 6.0 && last_t < 8.5, "{last_t}");
+        assert!(last_t > 2.1 && last_t < 2.6, "{last_t}");
         assert!(w.windows(2).all(|p| p[0].1 < p[1].1));
         let pcts = step_pcts(nits(140), &w);
         assert!(pcts.iter().all(|&p| p < MAX_PCT), "{pcts:?}");
         // It eases in and out.
-        assert!(pcts[0] < 0.05 && pcts[pcts.len() - 1] < 0.05, "{pcts:?}");
+        assert!(pcts[0] < 0.1 && pcts[pcts.len() - 1] < 0.1, "{pcts:?}");
         assert!(ch.ramp.is_none());
     }
 
-    /// Largest step of a change sped up to take MAX_CHANGE, in percent:
-    /// a full swing goes at 0.18 ln/s, 0.32 % a write.
-    const FAST_PCT: f32 = 0.36;
-
     #[test]
-    fn a_full_swing_takes_8_seconds() {
-        // 12 s at the screen's own speed; MAX_CHANGE makes it faster.
+    fn the_whole_range_takes_about_8_seconds() {
         let t = Instant::now();
-        let mut ch = screen(nits(125));
-        assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(nits(500)));
-        let w = run(&mut ch, t, SCREEN_WRITE);
-        let last_t = w.last().unwrap().0;
-        assert_eq!(w.last().unwrap().1, nits(500));
-        assert!(last_t > 7.5 && last_t < 8.1, "{last_t}");
-        assert!(step_pcts(nits(125), &w).iter().all(|&p| p < FAST_PCT));
-        // Falls are the same the other way.
-        let mut ch = screen(nits(500));
-        ch.head_for(nits(125), t);
-        let w = run(&mut ch, t, SCREEN_WRITE);
-        assert_eq!(w.last().unwrap().1, nits(125));
-        assert!(w.last().unwrap().0 < 8.1);
-        assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
-        assert!(step_pcts(nits(500), &w).iter().all(|&p| p < FAST_PCT));
-    }
-
-    #[test]
-    fn no_automatic_change_takes_longer_than_8_seconds() {
-        // From the lowest setting to the 25 % floor took 20 s; the whole
-        // range (the largest change) goes at 0.47 ln/s, 0.85 % a write.
-        let t = Instant::now();
-        for (from, to) in [(1, nits(125)), (nits(2), nits(500)), (nits(500), nits(2))] {
+        for (from, to) in [(nits(2), nits(500)), (nits(500), nits(2))] {
             let mut ch = screen(from);
             ch.head_for(to, t);
             let w = run(&mut ch, t, SCREEN_WRITE);
+            let last_t = w.last().unwrap().0;
             assert_eq!(w.last().unwrap().1, to);
-            assert!(w.last().unwrap().0 < 8.1, "{from} {to} {}", w.last().unwrap().0);
-            assert!(motion_pcts(from, &w).iter().skip(1).all(|&p| p < 0.9), "{from} {to}");
+            assert!(last_t > 7.6 && last_t < 8.4, "{from} {to} {last_t}");
+            assert!(motion_pcts(from, &w).iter().all(|&p| p < 0.9), "{from} {to}");
         }
-        // Changes that already take less are not sped up.
-        let mut ch = screen(nits(140));
-        ch.head_for(nits(315), t);
-        assert_eq!(ch.ramp.as_ref().unwrap().motion.speed, SCREEN_MOTION.speed);
+        // A full swing on AC (125 to 500 nits) takes about 3.5 s.
+        let mut ch = screen(nits(125));
+        assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(nits(500)));
+        let w = run(&mut ch, t, SCREEN_WRITE);
+        assert!(w.last().unwrap().0 > 3.2 && w.last().unwrap().0 < 3.8, "{}", w.last().unwrap().0);
     }
 
     #[test]
@@ -710,17 +759,16 @@ mod tests {
         let w = run(&mut ch, t, SCREEN_WRITE);
         assert_eq!(w[0], (0.0, nits(2)));
         let visible = w.iter().find(|x| x.1 > nits(2)).unwrap().0;
-        assert!(visible < 0.6, "{visible}");
+        assert!(visible < 0.3, "{visible}");
         let (last_t, last_v) = *w.last().unwrap();
         assert_eq!(last_v, nits(125));
-        assert!(last_t < 22.5, "{last_t}");
-        // Steps shrink as it gets brighter: 1/64 nit is 0.16 % at 10 nits,
-        // where the eye needs a few percent; above 100 nits they are as
-        // small as anywhere.
+        assert!(last_t < 5.5, "{last_t}");
+        // Steps shrink as it gets brighter: the eye needs bigger ones in the
+        // dark; above 100 nits they are as small as anywhere.
         let above = |n: u32| -> Vec<(f32, u32)> { w.iter().copied().filter(|x| x.1 > nits(n)).collect() };
         let (b10, b100) = (above(10), above(100));
-        assert!(step_pcts(b10[0].1, &b10[1..]).iter().all(|&p| p < 0.7));
-        assert!(step_pcts(b100[0].1, &b100[1..]).iter().all(|&p| p < 0.25));
+        assert!(step_pcts(b10[0].1, &b10[1..]).iter().all(|&p| p < 2.4));
+        assert!(step_pcts(b100[0].1, &b100[1..]).iter().all(|&p| p < 1.05));
     }
 
     #[test]
@@ -730,25 +778,33 @@ mod tests {
         start_change(&mut ch, nits(306), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
         assert_eq!(w.last().unwrap().1, nits(306));
-        assert!(w.last().unwrap().0 < 2.0, "{w:?}");
+        assert!(w.last().unwrap().0 < 0.5, "{w:?}");
     }
 
     #[test]
     fn a_new_target_keeps_the_speed() {
+        // The light shifts during a change: it heads elsewhere at the
+        // speed it has, without slowing down.
         let t = Instant::now();
         let mut ch = screen(nits(140));
         ch.update(1000.0, 0.0, t);
-        let mid = t + Duration::from_secs(5);
+        let mid = t + Duration::from_secs(1);
         let before = run_until(&mut ch, t, mid);
         let speed = ch.ramp.as_ref().unwrap().speed();
         let due = ch.next_frame();
-        assert_eq!(ch.update(300.0, 0.0, mid), Update::Moving(nits(350)));
+        let to = desired(&ch.settings, 800.0, 0.0);
+        assert_eq!(ch.update(800.0, 0.0, mid), Update::Moving(to));
         assert_eq!(ch.ramp.as_ref().unwrap().speed(), speed);
+        assert_eq!(ch.ramp.as_ref().unwrap().motion.speed, SCREEN_MOTION.speed);
         assert_eq!(ch.next_frame(), due);
         let after = run(&mut ch, t, SCREEN_WRITE);
-        assert_eq!(after.last().unwrap().1, nits(350));
+        assert_eq!(after.last().unwrap().1, to);
         let all: Vec<_> = before.into_iter().chain(after).collect();
-        assert!(step_pcts(nits(140), &all).iter().all(|&p| p < FAST_PCT));
+        assert!(step_pcts(nits(140), &all).iter().all(|&p| p < MAX_PCT));
+        // Full speed on until it slows down for the end.
+        let m = motion_pcts(nits(140), &all);
+        let mid_run: Vec<f32> = all.iter().zip(&m).filter(|(x, _)| x.0 > 0.8 && x.0 < 1.8).map(|(_, &p)| p).collect();
+        assert!(mid_run.iter().all(|&p| p > 0.7), "{mid_run:?}");
     }
 
     #[test]
@@ -756,7 +812,7 @@ mod tests {
         let t = Instant::now();
         let mut ch = screen(nits(140));
         start_change(&mut ch, nits(400), t);
-        let mid = t + Duration::from_secs(6);
+        let mid = t + Duration::from_secs(1);
         let before = run_until(&mut ch, t, mid);
         let top = before.last().unwrap().1;
         start_target(&mut ch, nits(150));
@@ -774,7 +830,7 @@ mod tests {
         let t = Instant::now();
         let mut ch = screen(nits(140));
         start_change(&mut ch, nits(400), t);
-        let mid = t + Duration::from_secs(6);
+        let mid = t + Duration::from_millis(1200);
         let before = run_until(&mut ch, t, mid);
         // At full speed, now asked to stop just ahead.
         let near = before.last().unwrap().1 + nits(1);
@@ -782,6 +838,78 @@ mod tests {
         let after = run(&mut ch, t, SCREEN_WRITE);
         assert!(after.iter().all(|w| w.1 <= near), "{after:?}");
         assert_eq!(after.last().unwrap().1, near);
+    }
+
+    /// A panel like the M1 Pro's: it follows the written value until 250
+    /// nits, then rises 1.5 times as fast.
+    fn kinked_map() -> Rc<PanelMap> {
+        let k = nits(250) as f32;
+        let points = (0..=60).map(|i| {
+            let w = i as f32 * nits(10) as f32;
+            (w, if w <= k { w } else { k + 1.5 * (w - k) })
+        });
+        Rc::new(PanelMap::new(points.collect()).unwrap())
+    }
+
+    #[test]
+    fn panel_map_lines_and_inverse() {
+        let map = PanelMap::new(vec![(100.0, 120.0), (200.0, 250.0), (150.0, 150.0), (300.0, 240.0)]).unwrap();
+        // (300, 240) does not rise in what it shows, so it is dropped.
+        assert_eq!(map.points(), &[(100.0, 120.0), (150.0, 150.0), (200.0, 250.0)]);
+        assert_eq!(map.shown(125.0), 135.0);
+        assert_eq!(map.shown(175.0), 200.0);
+        assert_eq!(map.written(200.0), 175.0);
+        // Outside the points: the nearest point's offset.
+        assert_eq!(map.shown(50.0), 70.0);
+        assert_eq!(map.shown(260.0), 310.0);
+        for w in [60.0, 101.0, 149.0, 199.5, 400.0] {
+            assert!((map.written(map.shown(w)) - w).abs() < 1e-3, "{w}");
+        }
+        assert!(PanelMap::new(vec![(1.0, 1.0)]).is_none());
+    }
+
+    #[test]
+    fn with_a_panel_map_changes_are_even_in_what_the_panel_shows() {
+        let t = Instant::now();
+        let map = kinked_map();
+        let mut ch = screen(nits(150));
+        ch.map = Some(map.clone());
+        ch.head_for(nits(400), t);
+        let w = run(&mut ch, t, SCREEN_WRITE);
+        assert_eq!(w.last().unwrap().1, nits(400));
+        // In what the panel shows, the steps at full speed (0.75 % a write
+        // 16 ms apart) are all alike across the kink ...
+        let shown: Vec<(f32, u32)> = w.iter().map(|&(t, v)| (t, map.shown(v as f32).round() as u32)).collect();
+        let from = map.shown(nits(150) as f32) as u32;
+        let even: Vec<f32> = motion_pcts(from, &shown).into_iter().zip(&w).filter(|(_, x)| x.0 > 0.8 && x.0 < w.last().unwrap().0 - 0.8).map(|(p, _)| p).collect();
+        let (lo, hi) = (even.iter().cloned().fold(9.0, f32::min), even.iter().cloned().fold(0.0, f32::max));
+        assert!(lo > 0.73 && hi < 0.77, "{lo} {hi}");
+        // ... while the written values slow down above it.
+        let below = w.iter().find(|x| x.1 > nits(200)).unwrap();
+        let above = w.iter().find(|x| x.1 > nits(330)).unwrap();
+        let rate = |x: &(f32, u32)| {
+            let i = w.iter().position(|y| y == x).unwrap();
+            ((w[i].1 as f32).ln() - (w[i - 1].1 as f32).ln()) / (w[i].0 - w[i - 1].0)
+        };
+        assert!(rate(above) < rate(below) * 0.8, "{} {}", rate(below), rate(above));
+    }
+
+    #[test]
+    fn with_a_panel_map_key_steps_are_even_in_what_the_panel_shows() {
+        let t = Instant::now();
+        let map = kinked_map();
+        let mut ch = screen(nits(2));
+        ch.map = Some(map.clone());
+        let off = nits(500) as f32 * DARK_PCT / 100.0;
+        let mut levels = vec![map.shown(ch.known as f32)];
+        for _ in 0..16 {
+            tap(&mut ch, 1, t);
+            levels.push(map.shown(ch.known as f32));
+        }
+        assert_eq!(ch.known, nits(500));
+        let gaps: Vec<f32> = levels.windows(2).map(|p| ((p[1] + off) / (p[0] + off)).ln()).collect();
+        let (lo, hi) = (gaps.iter().cloned().fold(9.0, f32::min), gaps.iter().cloned().fold(0.0, f32::max));
+        assert!(hi - lo < 0.004, "{gaps:?}");
     }
 
     /// Points a running change somewhere else, as update() does.
@@ -924,7 +1052,7 @@ mod tests {
         let (fast_t, slow_t) = (fast.last().unwrap().0, slow.last().unwrap().0);
         assert!((fast_t - slow_t).abs() < 0.2, "{fast_t} {slow_t}");
         assert!(slow.len() * 5 / 2 < fast.len(), "{} {}", slow.len(), fast.len());
-        assert!(step_pcts(nits(140), &slow).iter().all(|&p| p < 0.6));
+        assert!(step_pcts(nits(140), &slow).iter().all(|&p| p < 2.6));
     }
 
     #[test]

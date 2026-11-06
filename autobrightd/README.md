@@ -17,7 +17,7 @@ writes less often, and changes brightness in steps too small to see:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | at most 11 % a second, easing in and out; with the [kernel patches](../kernel), 140 → 315 nits is about 460 writes over 7.4 s, 0.21 % at most (without them about 155, 0.54 %) |
+| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | the lowest level to the maximum in about 8 s, easing in and out, at most 0.8 % a write with the [kernel patches](../kernel); with a panel map, even in what the panel shows |
 | Runs as | root | your user (udev rule below) |
 
 Writes matter: without the [kernel patches](../kernel), every screen write
@@ -40,28 +40,42 @@ takes about 60 a second.
 - **Dead band.** A new target is acted on only if it is at least 2 % of
   `max_brightness` away from the current one, or if it is 0.
 - **Transitions.** Around 20 Hz the eye picks up a brightness step of
-  roughly 1 % on a large bright field, so the only way to make a change
-  invisible is to make each step small. A change moves at no more than
-  11 % a second, speeding up over the first 0.75 s and slowing down over
-  the last. It writes up to 60 times a second, so that is 0.2 % per write
-  with the [kernel patches](../kernel); without them the DCP driver takes
-  only about 21 writes a second, and the same change takes as long in
-  steps of 0.54 %. It is
-  measured in ratios of (brightness + 3 % of the maximum): ratios because
-  that is what the eye sees, the 3 % because in the dark the eye needs
-  bigger steps and the panel shows nothing below 2 nits, so pure ratios
-  would crawl there for minutes. Its length follows its size, up to 8 s:
-  about 0.6 s for a small change, 7.4 s for 140 to 315 nits; a change that
-  would take longer at that speed (25 % to 100 % would take 12 s, the
-  lowest setting to 25 % 20 s) goes faster, up to 0.8 % per write, and
-  takes 8 s;
-  from below 2 nits it starts at 2 nits, which looks the same, so it
-  rises from the first moment. A new target during a change keeps the
-  speed it has; one in the other direction slows down first, and nothing
-  overshoots. Each write is the nearest whole value, which needs the
+  roughly 1 % on a large bright field, so a change is made of many small
+  steps. Every change moves at the same speed, measured in ratios of
+  (brightness + 3 % of the maximum): ratios because that is what the eye
+  sees, the 3 % because in the dark the eye needs bigger steps and the
+  panel shows nothing below 2 nits, so pure ratios would crawl there for
+  minutes. From the lowest level to the maximum takes about 8 s: top speed
+  0.47 a second in that space, reached and given up over 0.75 s, 0.8 % per
+  write at 60 writes a second with the [kernel patches](../kernel) (without
+  them the DCP driver takes about 21 writes a second, and the same change
+  takes as long in steps of 2.2 %). A small change takes about 0.35 s, 140
+  to 315 nits 2.4 s, 25 % to 100 % 3.5 s. From below 2 nits it starts at
+  2 nits, which looks the same, so it rises from the first moment. A new
+  target during a change keeps the speed it has (it never slows down
+  because the light moved); one in the other direction slows down first,
+  and nothing overshoots. Each write is the nearest whole value, which needs the
   kernel patch for 1/64 nit to stay smooth; with whole nits the slow parts
   move in 1-nit steps. The keyboard moves much faster (off to
   75 % in about 2 s): nobody watches it fade.
+- **Panel map.** The panel does not follow the driver's nits evenly. What
+  the DCP reports it shows (`actual_brightness`, whole nits, about 26 ms
+  late) rises 1.4 times as fast as the written value just above about 130
+  and 255 nits and only 0.7 times as fast near the top (measured on an M1
+  Pro), so an even change of the written value lurches there.
+  `autobrightd --calibrate` measures this once: with autobrightd stopped it
+  sweeps the screen from its lowest level to the maximum and back (34 s
+  each way) and notes, for every reported nit, the written value where it
+  was reached going up and where it was left going down; halfway between
+  the two is where the panel shows exactly that nit, the report's delay
+  and rounding cancelling out (494 points on the M1 Pro). It is saved in
+  `$XDG_STATE_HOME/autobrightd/panel` (`~/.local/state/autobrightd/panel`)
+  and read at startup; changes and key steps then move evenly in what the
+  panel shows. Measured during a change from 175 to 450 nits at full
+  speed, the reported brightness changed at 0.88 to 1.15 times its mean
+  rate with the map (the rest is the reports' 1-nit rounding) and at 0.54
+  to 1.44 times without. A map made for another `max_brightness` (other
+  kernel patches) is ignored with a message: calibrate again.
 - **Brightness keys.** The [backlight](../backlight) command sends SIGUSR1
   (brighter) or SIGUSR2 (dimmer) for a press or repeat, and SIGRTMIN when
   the key is let go ([mediakeyd](../mediakeyd)'s `release` binding). A tap
@@ -120,6 +134,14 @@ cargo build --release
 install -m 755 target/release/autobrightd ~/.local/bin/
 sudo install -D -m 644 autobrightd/90-autobrightd.rules /etc/udev/rules.d/90-autobrightd.rules
 sudo udevadm trigger --action=add /sys/class/backlight/apple-panel-bl /sys/class/leds/kbd_backlight
+```
+
+Then measure the panel once (the screen sweeps up and down for about
+70 s), with autobrightd stopped:
+
+```sh
+pkill -x autobrightd
+autobrightd --calibrate
 ```
 
 Try it in the foreground first. `-n` reads the sensor and prints what it
