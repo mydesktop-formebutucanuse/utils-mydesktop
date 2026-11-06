@@ -1,0 +1,10 @@
+[package]
+name = "scd"
+version = "0.1.0"
+description = "Give Window Maker's GUI scale factor to GTK, Chromium, Electron and Qt applications (XSETTINGS manager)"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies: libX11 is called directly (src/xlib.rs).
