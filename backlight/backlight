@@ -1,9 +1,13 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Change the screen or keyboard backlight through elogind's
-# Session.SetBrightness, so no root or udev rule is needed.
+# Brightness keys.
 #
-# usage: backlight screen|kbd +N|-N     (N = percent of the maximum)
+#   backlight screen +N|-N   one step brighter or dimmer. autobrightd does
+#                            the change: 16 steps from 2 nits to the
+#                            maximum, even as the eye sees them, each one a
+#                            short glide. N only gives the direction.
+#   backlight kbd +N|-N      keyboard backlight by N % of its maximum,
+#                            through elogind's Session.SetBrightness.
 set -eu
 
 usage() {
@@ -11,52 +15,46 @@ usage() {
 	exit 2
 }
 
-case "${1:-}" in
-screen)
-	subsys=backlight
-	dir=$(ls -d /sys/class/backlight/* 2>/dev/null | head -n 1)
-	;;
-kbd)
-	subsys=leds
-	dir=/sys/class/leds/kbd_backlight
-	min=0
-	;;
-*)
-	usage
-	;;
-esac
-
 pct=${2:-}
 case "$pct" in
 [+-][0-9]*) ;;
 *) usage ;;
 esac
 
-if [ -z "$dir" ] || [ ! -r "$dir/brightness" ]; then
-	echo "${0##*/}: no $1 backlight found" >&2
-	exit 1
-fi
-
-cur=$(cat "$dir/brightness")
-max=$(cat "$dir/max_brightness")
-if [ "$1" = screen ]; then
-	# Stop at 0.4 % of the maximum: 2 nits on a 500-nit Apple panel, whose
-	# driver shows everything from 0 to 2 nits at the same lowest level.
-	# At least 1, as 0 turns some other panels off completely.
-	min=$((max * 4 / 1000))
-	[ "$min" -ge 1 ] || min=1
-fi
-step=$((max * ${pct#?} / 100))
-[ "$step" -ge 1 ] || step=1
-
-case "$pct" in
--*) new=$((cur - step)) ;;
-*) new=$((cur + step)) ;;
+case "${1:-}" in
+screen)
+	# autobrightd takes SIGUSR1 as brighter and SIGUSR2 as dimmer.
+	case "$pct" in
+	-*) sig=USR2 ;;
+	*) sig=USR1 ;;
+	esac
+	if ! pkill "-$sig" -x -u "$(id -u)" autobrightd; then
+		echo "${0##*/}: autobrightd is not running" >&2
+		exit 1
+	fi
+	;;
+kbd)
+	dir=/sys/class/leds/kbd_backlight
+	if [ ! -r "$dir/brightness" ]; then
+		echo "${0##*/}: no keyboard backlight" >&2
+		exit 1
+	fi
+	cur=$(cat "$dir/brightness")
+	max=$(cat "$dir/max_brightness")
+	step=$((max * ${pct#?} / 100))
+	[ "$step" -ge 1 ] || step=1
+	case "$pct" in
+	-*) new=$((cur - step)) ;;
+	*) new=$((cur + step)) ;;
+	esac
+	[ "$new" -ge 0 ] || new=0
+	[ "$new" -le "$max" ] || new=$max
+	exec dbus-send --system --print-reply=literal \
+		--dest=org.freedesktop.login1 /org/freedesktop/login1/session/auto \
+		org.freedesktop.login1.Session.SetBrightness \
+		string:leds string:kbd_backlight uint32:"$new" >/dev/null
+	;;
+*)
+	usage
+	;;
 esac
-[ "$new" -ge "$min" ] || new=$min
-[ "$new" -le "$max" ] || new=$max
-
-exec dbus-send --system --print-reply=literal \
-	--dest=org.freedesktop.login1 /org/freedesktop/login1/session/auto \
-	org.freedesktop.login1.Session.SetBrightness \
-	string:"$subsys" string:"${dir##*/}" uint32:"$new" >/dev/null

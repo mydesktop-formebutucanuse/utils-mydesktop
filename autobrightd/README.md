@@ -54,6 +54,14 @@ cannot overlap: about 21 a second is the limit.
   [kernel patch](../kernel) (1/16 nit) to stay smooth; with whole nits the
   slow parts move in 1-nit steps. The keyboard moves much faster (off to
   75 % in about 4 s): nobody watches it fade.
+- **Brightness keys.** The [backlight](../backlight) command sends SIGUSR1
+  (brighter) or SIGUSR2 (dimmer). Each press moves the screen 1/16 of the
+  way between 2 nits and the maximum in the same ratio space as
+  transitions, so every press looks the same size, and the screen glides
+  there in about 0.3 s, easing in and out over about six writes. Held down (key repeat), it sweeps the whole range
+  in about 1.7 s, and presses never run more than two steps ahead, so it stops
+  soon after the key is let go. Like any manual change, the light is then
+  left alone until it changes a lot.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is

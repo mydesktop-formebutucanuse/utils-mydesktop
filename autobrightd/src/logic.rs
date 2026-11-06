@@ -74,6 +74,18 @@ pub const SCREEN_MOTION: Motion = Motion { speed: 0.0027 / 0.048, accel: 0.0027 
 /// ratio, so it moves much faster: off to 75 % in about 4 s.
 pub const KBD_MOTION: Motion = Motion { speed: 1.0, accel: 1.0 };
 
+/// Brightness keys go from the lowest level to the maximum in this many
+/// presses, evenly spaced in the same ratio space as transitions, so every
+/// press looks the same size (macOS has 16 steps too).
+pub const KEY_STEPS: f32 = 16.0;
+/// A press glides there in about 0.3 s, easing in and out over about six
+/// writes (2 to 7 % each); held down, the key sweeps the whole range in
+/// about 1.7 s.
+pub const KEY_MOTION: Motion = Motion { speed: 2.5, accel: 8.0 };
+/// Presses may run at most this many steps ahead of the brightness, so it
+/// stops soon after the key is let go.
+const KEY_LEAD: f32 = 2.0;
+
 /// Time between writes while a change runs, about 22 a second. A screen
 /// write takes about this long anyway: the Apple DCP driver sleeps 42 ms and
 /// runs a display commit under the backlight lock (43 to 47 ms measured).
@@ -172,6 +184,9 @@ impl LuxFilter {
 /// steps.
 pub struct Ramp {
     pub to: u32,
+    pub motion: Motion,
+    /// Started by brightness keys rather than by the light.
+    pub by_key: bool,
     /// The dark offset in units (DARK_PCT of the maximum).
     off: f32,
     pos: f32,
@@ -180,13 +195,18 @@ pub struct Ramp {
     next_at: Instant,
 }
 
+/// The dark offset of a channel in units: DARK_PCT of its maximum.
+fn dark_offset(s: &Settings) -> f32 {
+    (s.max as f32 * DARK_PCT / 100.0).max(1.0)
+}
+
 impl Ramp {
-    pub fn new(from: u32, to: u32, s: &Settings, now: Instant) -> Ramp {
-        let off = (s.max as f32 * DARK_PCT / 100.0).max(1.0);
+    pub fn new(from: u32, to: u32, s: &Settings, motion: Motion, now: Instant) -> Ramp {
+        let off = dark_offset(s);
         // Below the dead zone nothing shows; start rising at its top.
         let from = if from < s.dead_zone && to > s.dead_zone { s.dead_zone } else { from };
         let pos = (from as f32 + off).ln();
-        Ramp { to, off, pos, speed: 0.0, last: now, next_at: now }
+        Ramp { to, motion, by_key: false, off, pos, speed: 0.0, last: now, next_at: now }
     }
 
     /// Current speed, in ln units per second.
@@ -197,7 +217,8 @@ impl Ramp {
 
     /// Moves on to `now`. Returns the whole value there, and whether the
     /// target has been reached.
-    pub fn advance(&mut self, now: Instant, m: Motion) -> (u32, bool) {
+    pub fn advance(&mut self, now: Instant) -> (u32, bool) {
+        let m = self.motion;
         // A long gap (a suspend, say) must not turn into one big step.
         let dt = now.saturating_duration_since(self.last).as_secs_f32().min(0.25);
         self.last = now;
@@ -274,8 +295,15 @@ impl Channel {
             self.target = want;
             match &mut self.ramp {
                 // Only where it heads changes; position, speed and beat stay.
-                Some(ramp) => ramp.to = want,
-                None => self.ramp = Some(Ramp::new(self.known, want, &self.settings, now)),
+                Some(ramp) => {
+                    ramp.to = want;
+                    ramp.motion = self.settings.motion;
+                    ramp.by_key = false;
+                }
+                None => {
+                    let ramp = Ramp::new(self.known, want, &self.settings, self.settings.motion, now);
+                    self.ramp = Some(ramp);
+                }
             }
             result = Update::Moving(want);
         }
@@ -290,18 +318,54 @@ impl Channel {
     /// The value to write now, if a write is due and the change has moved
     /// away from what the file holds.
     pub fn frame(&mut self, now: Instant) -> Option<u32> {
-        let motion = self.settings.motion;
         let ramp = self.ramp.as_mut()?;
         if now < ramp.next_at {
             return None;
         }
-        let (value, arrived) = ramp.advance(now, motion);
+        let (value, arrived) = ramp.advance(now);
         if arrived {
             self.ramp = None;
         } else {
             ramp.next_at = now + FRAME;
         }
         (value != self.known).then_some(value)
+    }
+
+    /// Brightness keys: `presses` steps up (+) or down (-). A step is
+    /// 1/KEY_STEPS of the way from the lowest level that shows (the top of
+    /// the dead zone) to the maximum, in the ratio space of transitions, so
+    /// each press looks the same size. The brightness glides there quickly
+    /// (KEY_MOTION), and, as after any manual change, the light is left
+    /// alone until it changes a lot. Returns the new target.
+    pub fn key_step(&mut self, presses: i32, lux: f32, now: Instant) -> u32 {
+        let off = dark_offset(&self.settings);
+        let lowest = self.settings.dead_zone.max(1);
+        let (lo, hi) = ((lowest as f32 + off).ln(), (self.settings.max as f32 + off).ln());
+        let step = (hi - lo) / KEY_STEPS;
+        let (pos, base) = match &self.ramp {
+            // Presses during a key glide add up from where it heads.
+            Some(r) if r.by_key => (r.pos, (r.to as f32 + off).ln()),
+            Some(r) => (r.pos, r.pos),
+            None => {
+                let x = (self.known.max(lowest) as f32 + off).ln();
+                (x, x)
+            }
+        };
+        let want = (base + presses as f32 * step)
+            .clamp(pos - KEY_LEAD * step, pos + KEY_LEAD * step)
+            .clamp(lo, hi);
+        let to = if want >= hi - 1e-4 {
+            self.settings.max
+        } else {
+            ((want.exp() - off).round() as u32).clamp(lowest, self.settings.max)
+        };
+        self.target = to;
+        self.override_lux = Some(lux);
+        let ramp = self.ramp.get_or_insert_with(|| Ramp::new(self.known, to, &self.settings, KEY_MOTION, now));
+        ramp.to = to;
+        ramp.motion = KEY_MOTION;
+        ramp.by_key = true;
+        to
     }
 
     /// Records a successful write of `value`. Read the file back afterwards
@@ -377,7 +441,7 @@ mod tests {
 
     fn start_change(ch: &mut Channel, to: u32, t: Instant) {
         ch.target = to;
-        ch.ramp = Some(Ramp::new(ch.known, to, &ch.settings, t));
+        ch.ramp = Some(Ramp::new(ch.known, to, &ch.settings, ch.settings.motion, t));
     }
 
     /// Runs frames as the daemon would until `until`; returns the writes.
@@ -578,6 +642,86 @@ mod tests {
     fn start_target(ch: &mut Channel, to: u32) {
         ch.target = to;
         ch.ramp.as_mut().unwrap().to = to;
+    }
+
+    /// Screen value after `n` presses up from the lowest level.
+    fn key_level(n: i32) -> u32 {
+        let t = Instant::now();
+        let mut ch = screen(nits(2));
+        for _ in 0..n {
+            ch.key_step(1, 10.0, t);
+            run(&mut ch, t, SCREEN_WRITE);
+        }
+        ch.known
+    }
+
+    #[test]
+    fn sixteen_presses_span_the_range_in_even_ratios() {
+        assert_eq!(key_level(0), nits(2));
+        assert_eq!(key_level(16), nits(500));
+        let levels: Vec<u32> = (0..=16).map(key_level).collect();
+        let off = nits(500) as f32 * DARK_PCT / 100.0;
+        let gaps: Vec<f32> =
+            levels.windows(2).map(|p| ((p[1] as f32 + off) / (p[0] as f32 + off)).ln()).collect();
+        let (lo, hi) = (gaps.iter().cloned().fold(f32::MAX, f32::min), gaps.iter().cloned().fold(0.0, f32::max));
+        // Even to within 1.5 % (rounding to whole units near the bottom).
+        assert!(hi - lo < 0.004, "{gaps:?}");
+        // In plain ratios the presses grow from x3 near the bottom to x1.25
+        // at the top, as the eye needs bigger steps in the dark.
+        assert!(levels[16] as f32 / levels[15] as f32 > 1.2, "{levels:?}");
+    }
+
+    #[test]
+    fn a_press_glides_in_about_a_third_of_a_second() {
+        let t = Instant::now();
+        let mut ch = screen(nits(300));
+        let to = ch.key_step(-1, 10.0, t);
+        let w = run(&mut ch, t, SCREEN_WRITE);
+        assert_eq!(w.last().unwrap().1, to);
+        let last_t = w.last().unwrap().0;
+        assert!(last_t > 0.25 && last_t < 0.4, "{last_t} {w:?}");
+        assert!(w.len() >= 5, "{w:?}");
+        assert!(step_pcts(nits(300), &w).iter().all(|&p| p < 7.0), "{w:?}");
+        assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
+        // A manual change: the light is left alone until it changes a lot.
+        assert_eq!(ch.update(12.0, 30.0, t), Update::Nothing);
+        assert_eq!(ch.update(500.0, 30.0, t), Update::Moving(nits(500)));
+    }
+
+    #[test]
+    fn holding_a_key_sweeps_and_stops_soon_after() {
+        // mediakeyd repeats every 40 ms after 660 ms.
+        let t = Instant::now();
+        let mut ch = screen(nits(2));
+        let mut presses = vec![t];
+        let mut at = t + Duration::from_millis(660);
+        while at < t + Duration::from_millis(2300) {
+            presses.push(at);
+            at += Duration::from_millis(40);
+        }
+        let mut writes = Vec::new();
+        for &p in &presses {
+            writes.extend(run_until(&mut ch, t, p));
+            ch.key_step(1, 10.0, p);
+        }
+        let release = presses.last().unwrap();
+        let rest = run(&mut ch, t, SCREEN_WRITE);
+        // Full brightness after about 1.7 s of repeats, and it stops within
+        // 0.4 s of the release.
+        assert_eq!(rest.last().unwrap_or(writes.last().unwrap()).1, nits(500));
+        let end = rest.last().map_or(0.0, |w| w.0);
+        assert!(end - (*release - t).as_secs_f32() < 0.4, "{end}");
+        assert!(writes.windows(2).chain(rest.windows(2)).all(|p| p[0].1 <= p[1].1));
+    }
+
+    #[test]
+    fn a_press_at_the_bottom_stays_there() {
+        let t = Instant::now();
+        let mut ch = screen(nits(2));
+        assert_eq!(ch.key_step(-1, 10.0, t), nits(2));
+        assert!(run(&mut ch, t, SCREEN_WRITE).is_empty());
+        let mut ch = screen(1);
+        assert_eq!(ch.key_step(-3, 10.0, t), nits(2));
     }
 
     #[test]
