@@ -17,7 +17,7 @@ writes less often, and changes brightness in steps too small to see:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | at most 5.6 % a second, easing in and out; with the [kernel patches](../kernel), 140 → 315 nits is about 920 writes over 15 s, 0.1 % at most (without them about 300, 0.27 %) |
+| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | at most 11 % a second, easing in and out; with the [kernel patches](../kernel), 140 → 315 nits is about 460 writes over 7.4 s, 0.21 % at most (without them about 155, 0.54 %) |
 | Runs as | root | your user (udev rule below) |
 
 Writes matter: without the [kernel patches](../kernel), every screen write
@@ -42,23 +42,23 @@ takes about 60 a second.
 - **Transitions.** Around 20 Hz the eye picks up a brightness step of
   roughly 1 % on a large bright field, so the only way to make a change
   invisible is to make each step small. A change moves at no more than
-  5.6 % a second, speeding up over the first 1.5 s and slowing down over
-  the last. It writes up to 60 times a second, so that is 0.1 % per write
+  11 % a second, speeding up over the first 0.75 s and slowing down over
+  the last. It writes up to 60 times a second, so that is 0.2 % per write
   with the [kernel patches](../kernel); without them the DCP driver takes
   only about 21 writes a second, and the same change takes as long in
-  steps of 0.27 %. It is
+  steps of 0.54 %. It is
   measured in ratios of (brightness + 3 % of the maximum): ratios because
   that is what the eye sees, the 3 % because in the dark the eye needs
   bigger steps and the panel shows nothing below 2 nits, so pure ratios
-  would crawl there for minutes. Its length follows its size: about 1.5 s
-  for a small change, 15 s for 140 to 315 nits, 25 s for 25 % to 100 %;
+  would crawl there for minutes. Its length follows its size: about 0.6 s
+  for a small change, 7.4 s for 140 to 315 nits, 12 s for 25 % to 100 %;
   from below 2 nits it starts at 2 nits, which looks the same, so it
   rises from the first moment. A new target during a change keeps the
   speed it has; one in the other direction slows down first, and nothing
   overshoots. Each write is the nearest whole value, which needs the
   kernel patch for 1/64 nit to stay smooth; with whole nits the slow parts
   move in 1-nit steps. The keyboard moves much faster (off to
-  75 % in about 4 s): nobody watches it fade.
+  75 % in about 2 s): nobody watches it fade.
 - **Brightness keys.** The [backlight](../backlight) command sends SIGUSR1
   (brighter) or SIGUSR2 (dimmer). Each press moves the screen 1/16 of the
   way between 2 nits and the maximum in the same ratio space as

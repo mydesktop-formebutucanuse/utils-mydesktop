@@ -63,17 +63,17 @@ pub struct Motion {
 /// dark end is compressed. 3 % is 15 nits on a 500-nit screen.
 pub const DARK_PCT: f32 = 3.0;
 
-/// The screen moves at most 5.6 % per second: about 0.1 % per write at 60
-/// writes a second (the kernel patches), 0.27 % at the 21 the DCP driver
+/// The screen moves at most 11 % per second: about 0.19 % per write at 60
+/// writes a second (the kernel patches), 0.54 % at the 21 the DCP driver
 /// takes without them. Around 20 Hz the eye picks up a brightness step of
 /// roughly 1 % on a large bright field: 1 % steps did show. Top speed is
-/// reached, and given up, over 1.5 s. A small change takes about 1.5 s,
-/// 140 to 315 nits about 15 s, 25 % to 100 % about 25 s, and the lowest
-/// setting to 25 % about 40 s.
-pub const SCREEN_MOTION: Motion = Motion { speed: 0.05625, accel: 0.05625 / 1.5 };
+/// reached, and given up, over 0.75 s. A small change takes about 0.75 s,
+/// 140 to 315 nits about 7.5 s, 25 % to 100 % about 12.5 s, and the lowest
+/// setting to 25 % about 20 s.
+pub const SCREEN_MOTION: Motion = Motion { speed: 0.1125, accel: 0.1125 / 0.75 };
 /// Nobody watches the keyboard fade, and from off every unit is a large
-/// ratio, so it moves much faster: off to 75 % in about 4 s.
-pub const KBD_MOTION: Motion = Motion { speed: 1.0, accel: 1.0 };
+/// ratio, so it moves much faster: off to 75 % in about 2 s.
+pub const KBD_MOTION: Motion = Motion { speed: 2.0, accel: 4.0 };
 
 /// Brightness keys go from the lowest level to the maximum in this many
 /// presses, evenly spaced in the same ratio space as transitions, so every
@@ -531,19 +531,19 @@ mod tests {
         assert!(y > 100.0, "{y}");
     }
 
-    /// Largest written step allowed on the screen, in percent: 0.1 % plus
+    /// Largest written step allowed on the screen, in percent: 0.2 % plus
     /// rounding to whole 1/64-nit units (0.0125 % at 125 nits).
-    const MAX_PCT: f32 = 0.12;
+    const MAX_PCT: f32 = 0.22;
 
     #[test]
-    fn screen_steps_stay_under_0_1_percent() {
+    fn screen_steps_stay_under_0_2_percent() {
         let t = Instant::now();
         let mut ch = screen(nits(140));
         start_change(&mut ch, nits(315), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
         let (last_t, last_v) = *w.last().unwrap();
         assert_eq!(last_v, nits(315));
-        assert!(last_t > 12.0 && last_t < 17.0, "{last_t}");
+        assert!(last_t > 6.0 && last_t < 8.5, "{last_t}");
         assert!(w.windows(2).all(|p| p[0].1 < p[1].1));
         let pcts = step_pcts(nits(140), &w);
         assert!(pcts.iter().all(|&p| p < MAX_PCT), "{pcts:?}");
@@ -553,14 +553,14 @@ mod tests {
     }
 
     #[test]
-    fn a_full_swing_takes_about_24_seconds() {
+    fn a_full_swing_takes_about_12_seconds() {
         let t = Instant::now();
         let mut ch = screen(nits(125));
         assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(nits(500)));
         let w = run(&mut ch, t, SCREEN_WRITE);
         let last_t = w.last().unwrap().0;
         assert_eq!(w.last().unwrap().1, nits(500));
-        assert!(last_t > 20.0 && last_t < 27.0, "{last_t}");
+        assert!(last_t > 10.0 && last_t < 13.5, "{last_t}");
         assert!(step_pcts(nits(125), &w).iter().all(|&p| p < MAX_PCT));
         // Falls are the same the other way.
         let mut ch = screen(nits(500));
@@ -584,14 +584,14 @@ mod tests {
         assert!(visible < 0.6, "{visible}");
         let (last_t, last_v) = *w.last().unwrap();
         assert_eq!(last_v, nits(125));
-        assert!(last_t < 45.0, "{last_t}");
+        assert!(last_t < 22.5, "{last_t}");
         // Steps shrink as it gets brighter: 1/64 nit is 0.16 % at 10 nits,
         // where the eye needs a few percent; above 100 nits they are as
         // small as anywhere.
         let above = |n: u32| -> Vec<(f32, u32)> { w.iter().copied().filter(|x| x.1 > nits(n)).collect() };
         let (b10, b100) = (above(10), above(100));
-        assert!(step_pcts(b10[0].1, &b10[1..]).iter().all(|&p| p < 0.4));
-        assert!(step_pcts(b100[0].1, &b100[1..]).iter().all(|&p| p < 0.13));
+        assert!(step_pcts(b10[0].1, &b10[1..]).iter().all(|&p| p < 0.7));
+        assert!(step_pcts(b100[0].1, &b100[1..]).iter().all(|&p| p < 0.25));
     }
 
     #[test]
@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn without_the_kernel_patches_a_change_takes_as_long() {
         // Writes then block for 46 ms, so there are a third as many, each
-        // three times the size, as small as before the patches.
+        // three times the size.
         let t = Instant::now();
         let mut ch = screen(nits(140));
         start_change(&mut ch, nits(315), t);
@@ -757,7 +757,7 @@ mod tests {
         let (fast_t, slow_t) = (fast.last().unwrap().0, slow.last().unwrap().0);
         assert!((fast_t - slow_t).abs() < 0.2, "{fast_t} {slow_t}");
         assert!(slow.len() * 5 / 2 < fast.len(), "{} {}", slow.len(), fast.len());
-        assert!(step_pcts(nits(140), &slow).iter().all(|&p| p < 0.36));
+        assert!(step_pcts(nits(140), &slow).iter().all(|&p| p < 0.6));
     }
 
     #[test]
@@ -786,7 +786,7 @@ mod tests {
         let w = run(&mut kbd, t, Duration::ZERO);
         assert_eq!(w.last().unwrap().1, 191);
         let last_t = w.last().unwrap().0;
-        assert!(last_t > 3.0 && last_t < 6.0, "{last_t}");
+        assert!(last_t > 1.5 && last_t < 3.0, "{last_t}");
         let frame = FRAME.as_secs_f32() - 1e-4;
         assert!(w.windows(2).all(|p| p[1].0 - p[0].0 >= frame), "{w:?}");
     }
