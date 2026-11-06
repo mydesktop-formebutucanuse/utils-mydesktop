@@ -2,9 +2,11 @@
 
 Patches for the Asahi Linux kernel.
 
-| Patch | What it does |
+| File | What it is |
 |---|---|
 | [0001-drm-apple-backlight-1-16-nit.patch](0001-drm-apple-backlight-1-16-nit.patch) | The panel backlight counts in 1/16 nit instead of whole nits |
+| [install.sh](install.sh) | Makes every Gentoo `asahi-kernel` build apply it |
+| [asahi-kernel.bashrc](asahi-kernel.bashrc) | The Portage hook that install.sh puts in place |
 
 ## 1/16-nit backlight
 
@@ -26,16 +28,27 @@ sliders, [backlight](../backlight), autobrightd) work as before. A script
 that writes raw nits now gets 1/16 of them.
 
 Written against `asahi-7.2.14-1` (Gentoo `sys-kernel/asahi-kernel-7.2.14_p1`).
-On Gentoo the ebuild applies user patches, so:
+
+## Applying it automatically on Gentoo
 
 ```sh
-sudo install -D -m 644 kernel/0001-drm-apple-backlight-1-16-nit.patch \
-	/etc/portage/patches/sys-kernel/asahi-kernel/0001-drm-apple-backlight-1-16-nit.patch
-sudo emerge --oneshot sys-kernel/asahi-kernel
+sudo sh kernel/install.sh
+sudo emerge --oneshot sys-kernel/asahi-kernel   # now, or wait for the next update
 ```
 
-and reboot. Later kernel versions pick the patch up as long as it still
-applies; if a build fails on it, check `drivers/gpu/drm/apple/dcp_backlight.c`.
+and reboot. `install.sh` puts the patch in `/usr/local/share/utils-mydesktop`
+and a Portage hook in `/etc/portage/env/sys-kernel/asahi-kernel`. From then
+on every `asahi-kernel` build, kernel updates included, runs the hook after
+the kernel's own patches: it applies the patch if it fits, skips it if the
+source already has it, and otherwise warns and builds without it. A kernel
+update therefore never fails because of the patch; a plain
+`/etc/portage/patches` entry would stop the build instead, so `install.sh`
+removes one if it finds it. It will not overwrite a hook file it did not
+write. `sudo sh kernel/install.sh remove` undoes it.
+
+If a build warns that the patch no longer fits, the backlight counts whole
+nits again (and [autobrightd](../autobrightd) shows 1-nit steps) until the
+patch is updated for the new `drivers/gpu/drm/apple/dcp_backlight.c`.
 
 The patch changes a file licensed GPL-2.0-only OR MIT and is under the same
 terms.
