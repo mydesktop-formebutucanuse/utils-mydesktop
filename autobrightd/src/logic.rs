@@ -78,10 +78,10 @@ pub const KBD_MOTION: Motion = Motion { speed: 1.0, accel: 1.0 };
 /// presses, evenly spaced in the same ratio space as transitions, so every
 /// press looks the same size (macOS has 16 steps too).
 pub const KEY_STEPS: f32 = 16.0;
-/// A press glides there in about 0.3 s, easing in and out over about six
-/// writes (2 to 7 % each); held down, the key sweeps the whole range in
-/// about 1.7 s.
-pub const KEY_MOTION: Motion = Motion { speed: 2.5, accel: 8.0 };
+/// A press glides there in about 0.65 s, in steps of at most 2 % per write
+/// (about 14 writes), easing in and out over 0.15 s; 6-7 % steps looked
+/// choppy. Held down, the key sweeps the whole range in about 8 s.
+pub const KEY_MOTION: Motion = Motion { speed: 0.02 / 0.048, accel: 0.02 / 0.048 / 0.15 };
 /// Presses may run at most this many steps ahead of the brightness, so it
 /// stops soon after the key is let go.
 const KEY_LEAD: f32 = 2.0;
@@ -439,6 +439,18 @@ mod tests {
             .collect()
     }
 
+    /// Each written step in the motion space (with the dark offset), in
+    /// percent: what the motion limits.
+    fn motion_pcts(from: u32, writes: &[(f32, u32)]) -> Vec<f32> {
+        let off = nits(500) as f32 * DARK_PCT / 100.0;
+        std::iter::once(from)
+            .chain(writes.iter().map(|w| w.1))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|p| ((p[1] as f32 + off) / (p[0] as f32 + off)).ln().abs() * 100.0)
+            .collect()
+    }
+
     fn start_change(ch: &mut Channel, to: u32, t: Instant) {
         ch.target = to;
         ch.ramp = Some(Ramp::new(ch.known, to, &ch.settings, ch.settings.motion, t));
@@ -672,16 +684,16 @@ mod tests {
     }
 
     #[test]
-    fn a_press_glides_in_about_a_third_of_a_second() {
+    fn a_press_glides_in_small_steps() {
         let t = Instant::now();
         let mut ch = screen(nits(300));
         let to = ch.key_step(-1, 10.0, t);
         let w = run(&mut ch, t, SCREEN_WRITE);
         assert_eq!(w.last().unwrap().1, to);
         let last_t = w.last().unwrap().0;
-        assert!(last_t > 0.25 && last_t < 0.4, "{last_t} {w:?}");
-        assert!(w.len() >= 5, "{w:?}");
-        assert!(step_pcts(nits(300), &w).iter().all(|&p| p < 7.0), "{w:?}");
+        assert!(last_t > 0.5 && last_t < 0.8, "{last_t} {w:?}");
+        assert!(w.len() >= 10, "{w:?}");
+        assert!(step_pcts(nits(300), &w).iter().all(|&p| p < 2.3), "{w:?}");
         assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
         // A manual change: the light is left alone until it changes a lot.
         assert_eq!(ch.update(12.0, 30.0, t), Update::Nothing);
@@ -689,13 +701,13 @@ mod tests {
     }
 
     #[test]
-    fn holding_a_key_sweeps_and_stops_soon_after() {
-        // mediakeyd repeats every 40 ms after 660 ms.
+    fn holding_a_key_moves_steadily_and_stops_soon_after() {
+        // mediakeyd repeats every 40 ms after 660 ms; hold for 3 s.
         let t = Instant::now();
-        let mut ch = screen(nits(2));
+        let mut ch = screen(nits(20));
         let mut presses = vec![t];
         let mut at = t + Duration::from_millis(660);
-        while at < t + Duration::from_millis(2300) {
+        while at < t + Duration::from_millis(3000) {
             presses.push(at);
             at += Duration::from_millis(40);
         }
@@ -704,14 +716,16 @@ mod tests {
             writes.extend(run_until(&mut ch, t, p));
             ch.key_step(1, 10.0, p);
         }
-        let release = presses.last().unwrap();
-        let rest = run(&mut ch, t, SCREEN_WRITE);
-        // Full brightness after about 1.7 s of repeats, and it stops within
-        // 0.4 s of the release.
-        assert_eq!(rest.last().unwrap_or(writes.last().unwrap()).1, nits(500));
-        let end = rest.last().map_or(0.0, |w| w.0);
-        assert!(end - (*release - t).as_secs_f32() < 0.4, "{end}");
-        assert!(writes.windows(2).chain(rest.windows(2)).all(|p| p[0].1 <= p[1].1));
+        let release = (*presses.last().unwrap() - t).as_secs_f32();
+        writes.extend(run(&mut ch, t, SCREEN_WRITE));
+        let end = writes.last().unwrap().0;
+        assert!(end - release < 1.2, "{end} {release}");
+        assert!(writes.windows(2).all(|p| p[0].1 < p[1].1));
+        // 2 % a write in the motion space (more in plain ratios at 20 nits,
+        // where the eye needs it).
+        assert!(motion_pcts(nits(20), &writes).iter().all(|&p| p < 2.1), "{writes:?}");
+        // About 0.42 ln units a second: well up, but not at the top yet.
+        assert!(ch.known > nits(100) && ch.known < nits(500), "{}", ch.known);
     }
 
     #[test]

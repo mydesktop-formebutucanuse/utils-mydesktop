@@ -14,8 +14,8 @@ The screen is [autobrightd](../autobrightd)'s, which has to be running:
 `backlight screen` only sends it SIGUSR1 (brighter) or SIGUSR2 (dimmer).
 autobrightd moves the screen 1/16 of the way between 2 nits and the
 maximum per press, in steps that look the same size to the eye, gliding
-there in about 0.3 s; held down, the key sweeps the whole range in about
-1.7 s. The number after the sign only gives the direction.
+there in about 0.65 s; held down, the key sweeps the whole range in about
+8 s. The number after the sign only gives the direction.
 
 The keyboard backlight is set through elogind's (or systemd-logind's)
 `Session.SetBrightness` on the system D-Bus, which needs no root; the

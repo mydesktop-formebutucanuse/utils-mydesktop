@@ -58,9 +58,10 @@ cannot overlap: about 21 a second is the limit.
   (brighter) or SIGUSR2 (dimmer). Each press moves the screen 1/16 of the
   way between 2 nits and the maximum in the same ratio space as
   transitions, so every press looks the same size, and the screen glides
-  there in about 0.3 s, easing in and out over about six writes. Held down (key repeat), it sweeps the whole range
-  in about 1.7 s, and presses never run more than two steps ahead, so it stops
-  soon after the key is let go. Like any manual change, the light is then
+  there in about 0.65 s, in steps of at most 2 % per write that ease in and
+  out. Held down (key repeat), it moves steadily and sweeps the whole range
+  in about 8 s; presses never run more than two steps ahead, so it stops
+  within a second of letting go. Like any manual change, the light is then
   left alone until it changes a lot.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
