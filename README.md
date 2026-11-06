@@ -1,12 +1,13 @@
 # utils-mydesktop
 
-Small desktop utilities for X11, written for a Window Maker desktop on
-Gentoo (Asahi Linux).
+Small desktop utilities, written for a Window Maker (X11) desktop on
+Gentoo (Asahi Linux, Apple Silicon MacBook).
 
 | Tool | What it does |
 |---|---|
 | [mediakeyd](mediakeyd) | Runs commands for volume, brightness and media keys without grabbing them, so focused windows do not flicker |
 | [backlight](backlight) | Changes the screen or keyboard backlight through logind, without root |
+| [autobrightd](autobrightd) | Sets the screen and keyboard backlight from the ambient light sensor, and steps aside when you change them |
 
 ## Build
 

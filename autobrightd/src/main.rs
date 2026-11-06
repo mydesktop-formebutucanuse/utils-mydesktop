@@ -1,0 +1,369 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! autobrightd: ambient-light auto-brightness for Apple Silicon Macs on
+//! Asahi Linux. Drives the screen and keyboard backlights from the AOP
+//! ambient light sensor and steps aside when someone else changes them.
+//!
+//! It wakes 5 times a second while nothing changes (the sensor reports every
+//! 200 ms), and 20 times a second only while a change is running. Manual
+//! screen changes are noticed through sysfs_notify() on actual_brightness.
+
+mod logic;
+mod sys;
+
+use logic::{Channel, LuxFilter, Settings, Update};
+use std::path::Path;
+use std::process::exit;
+use std::time::{Duration, Instant};
+use sys::Attr;
+
+const ALS_NAME: &str = "aop-sensors-als";
+const SCREEN_DIR: &str = "/sys/class/backlight/apple-panel-bl";
+const KBD_DIR: &str = "/sys/class/leds/kbd_backlight";
+const AC_ONLINE: &str = "/sys/class/power_supply/macsmc-ac/online";
+
+/// The sensor reports every 200 ms; reading it more often finds the same value.
+const SAMPLE: Duration = Duration::from_millis(200);
+/// AC state is read every this many samples (once a second).
+const AC_EVERY: u32 = 5;
+/// While the panel is off, only DPMS is checked, this often.
+const DPMS_OFF_CHECK: Duration = Duration::from_secs(1);
+
+const USAGE: &str = "usage: autobrightd [-v] [-n]
+  -v  print what it does
+  -n  dry run: read the sensor and print, but write nothing";
+
+struct Backlight {
+    channel: Channel,
+    attr: Attr,
+}
+
+struct Daemon {
+    als: Attr,
+    screen: Backlight,
+    /// actual_brightness of the screen, only for its change notification.
+    screen_notify: Option<Attr>,
+    kbd: Option<Backlight>,
+    ac: Option<Attr>,
+    dpms: Option<Attr>,
+    verbose: bool,
+    dry_run: bool,
+    filter: LuxFilter,
+    lux: f32,
+    on_ac: bool,
+    panel_off: bool,
+    samples: u32,
+}
+
+fn open_backlight(name: &'static str, dir: &str, settings: Settings, write: bool) -> Result<Backlight, String> {
+    let attr = Attr::open(Path::new(dir).join("brightness"), write).map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
+            "\n  install 90-autobrightd.rules (see README) and be in the video group, or use -n"
+        } else {
+            ""
+        };
+        format!("{dir}/brightness: {e}{hint}")
+    })?;
+    let current = attr.read_u32().map_err(|e| format!("{}: {e}", attr.path.display()))?;
+    Ok(Backlight { channel: Channel::new(name, settings, current), attr })
+}
+
+fn max_brightness(dir: &str) -> Result<u32, String> {
+    let path = Path::new(dir).join("max_brightness");
+    sys::read_once(&path)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&m| m > 0)
+        .ok_or_else(|| format!("cannot read {}", path.display()))
+}
+
+impl Daemon {
+    fn open(verbose: bool, dry_run: bool) -> Result<Daemon, String> {
+        let write = !dry_run;
+        let als_dir = sys::find_iio(ALS_NAME).ok_or_else(|| {
+            format!(
+                "no IIO device named {ALS_NAME}\n  is /lib/firmware/apple/aop-als-cal.bin installed? \
+                 If it was added after boot, reboot once"
+            )
+        })?;
+        let als = Attr::open(als_dir.join("in_illuminance_input"), false)
+            .map_err(|e| format!("{}: {e}", als_dir.display()))?;
+
+        let screen_settings = Settings {
+            curve: logic::SCREEN_CURVE,
+            floor_pct: logic::SCREEN_FLOOR_PCT,
+            max: max_brightness(SCREEN_DIR)?,
+        };
+        let screen = open_backlight("screen", SCREEN_DIR, screen_settings, write)?;
+        let screen_notify = Attr::open(Path::new(SCREEN_DIR).join("actual_brightness"), false).ok();
+        // Read once so the notification is armed.
+        if let Some(n) = &screen_notify {
+            let _ = n.read_int();
+        }
+
+        let kbd = match max_brightness(KBD_DIR) {
+            Ok(max) => {
+                let settings = Settings { curve: logic::KBD_CURVE, floor_pct: logic::KBD_FLOOR_PCT, max };
+                Some(open_backlight("kbd", KBD_DIR, settings, write)?)
+            }
+            Err(_) => None,
+        };
+        let ac = Attr::open(AC_ONLINE, false).ok();
+        let dpms = sys::find_edp_dpms().and_then(|p| Attr::open(p, false).ok());
+
+        let d = Daemon {
+            als,
+            screen,
+            screen_notify,
+            kbd,
+            ac,
+            dpms,
+            verbose,
+            dry_run,
+            filter: LuxFilter::default(),
+            lux: 0.0,
+            on_ac: false,
+            panel_off: false,
+            samples: 0,
+        };
+        if verbose {
+            let path = |a: &Option<Attr>| a.as_ref().map_or("(none)".into(), |a| a.path.display().to_string());
+            eprintln!("autobrightd: als {}", d.als.path.display());
+            eprintln!("autobrightd: screen {} max {}", d.screen.attr.path.display(), d.screen.channel.settings.max);
+            match &d.kbd {
+                Some(k) => eprintln!("autobrightd: kbd {} max {}", k.attr.path.display(), k.channel.settings.max),
+                None => eprintln!("autobrightd: kbd (none)"),
+            }
+            eprintln!("autobrightd: ac {}, dpms {}, notify {}", path(&d.ac), path(&d.dpms), path(&d.screen_notify));
+            if dry_run {
+                eprintln!("autobrightd: dry run, nothing is written");
+            }
+        }
+        Ok(d)
+    }
+
+    fn log(&self, msg: std::fmt::Arguments) {
+        if self.verbose {
+            eprintln!("autobrightd: {msg}");
+        }
+    }
+
+    fn backlights(&mut self) -> impl Iterator<Item = &mut Backlight> {
+        std::iter::once(&mut self.screen).chain(self.kbd.as_mut())
+    }
+
+    /// Reads a backlight and notes a change made by someone else.
+    fn check(&mut self, which: Which) {
+        if self.dry_run {
+            return;
+        }
+        let lux = self.lux;
+        let verbose = self.verbose;
+        let Some(b) = self.get(which) else { return };
+        if let Ok(v) = b.attr.read_u32()
+            && b.channel.observe(v, lux)
+            && verbose
+        {
+            eprintln!("autobrightd: {} set to {v} by someone else, holding until the light changes", b.channel.name);
+        }
+    }
+
+    fn get(&mut self, which: Which) -> Option<&mut Backlight> {
+        match which {
+            Which::Screen => Some(&mut self.screen),
+            Which::Kbd => self.kbd.as_mut(),
+        }
+    }
+
+    /// One sensor sample: AC, DPMS, lux, keyboard check, new targets.
+    fn sample(&mut self, now: Instant) {
+        if self.samples.is_multiple_of(AC_EVERY)
+            && let Some(ac) = &self.ac
+        {
+            let on = ac.read_int().is_ok_and(|v| v == 1);
+            if on != self.on_ac {
+                self.on_ac = on;
+                self.log(format_args!("{}", if on { "on AC" } else { "on battery" }));
+            }
+        }
+        self.samples = self.samples.wrapping_add(1);
+
+        let off = self.dpms.as_ref().is_some_and(|d| {
+            let mut buf = [0; 32];
+            d.read_str(&mut buf).is_ok_and(|s| s != "On")
+        });
+        if off != self.panel_off {
+            self.panel_off = off;
+            self.log(format_args!("panel {}", if off { "off" } else { "on" }));
+            if off {
+                self.panel_turned_off();
+            }
+        }
+        if off {
+            return;
+        }
+
+        let raw = match self.als.read_int() {
+            Ok(v) => v as f32,
+            Err(e) => {
+                self.log(format_args!("reading lux: {e}"));
+                return;
+            }
+        };
+        self.lux = self.filter.update(raw);
+        // The LED class sends no change notification, so look each sample.
+        self.check(Which::Kbd);
+
+        let lux = self.lux;
+        let boost = if self.on_ac { logic::AC_SCREEN_BOOST_PCT } else { 0.0 };
+        let verbose = self.verbose;
+        for b in self.backlights() {
+            let boost = if b.channel.name == "screen" { boost } else { 0.0 };
+            let update = b.channel.update(lux, boost, now);
+            if !verbose {
+                continue;
+            }
+            if update == Update::Resumed {
+                eprintln!("autobrightd: {}: light changed (lux {lux:.0}), automatic again", b.channel.name);
+            }
+            if let Update::Moving(to) = update {
+                let steps = b.channel.ramp.as_ref().map_or(0, |r| r.steps());
+                eprintln!(
+                    "autobrightd: lux {raw:.0} (smoothed {lux:.0}): {} {} -> {to} in {steps} steps",
+                    b.channel.name, b.channel.known
+                );
+            }
+        }
+    }
+
+    /// Panel blanked: switch the keyboard off at once and stop all ramps.
+    /// Screen writes would only wake the DCP for nothing; the kernel keeps
+    /// the value for when the panel comes back.
+    fn panel_turned_off(&mut self) {
+        self.filter.reset();
+        self.screen.channel.stop();
+        let dry_run = self.dry_run;
+        if let Some(k) = &mut self.kbd {
+            k.channel.stop();
+            k.channel.override_lux = None;
+            if k.channel.known > 0 && (dry_run || k.attr.write_u32(0).is_ok()) {
+                k.channel.wrote(0);
+                k.channel.stop();
+            }
+        }
+    }
+
+    /// Writes ramp frames that are due.
+    fn frames(&mut self, now: Instant) {
+        for which in [Which::Screen, Which::Kbd] {
+            let due = self.get(which).and_then(|b| b.channel.next_frame()).is_some_and(|t| t <= now);
+            if !due {
+                continue;
+            }
+            // Someone may have changed it since our last write.
+            self.check(which);
+            let (dry_run, verbose) = (self.dry_run, self.verbose);
+            let Some(b) = self.get(which) else { continue };
+            let Some(value) = b.channel.frame(now) else { continue };
+            if dry_run {
+                b.channel.wrote(value);
+                if verbose {
+                    eprintln!("autobrightd: would write {} {value}", b.channel.name);
+                }
+                continue;
+            }
+            let started = Instant::now();
+            match b.attr.write_u32(value) {
+                Ok(()) => {
+                    // Read back: a driver may store something else.
+                    let stored = b.attr.read_u32().unwrap_or(value);
+                    b.channel.wrote(stored);
+                    if verbose {
+                        let ms = started.elapsed().as_millis();
+                        eprintln!("autobrightd: {} {stored} ({ms} ms)", b.channel.name);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("autobrightd: writing {}: {e}", b.attr.path.display());
+                    b.channel.stop();
+                }
+            }
+        }
+    }
+
+    fn run(&mut self) -> ! {
+        let mut next_sample = Instant::now();
+        loop {
+            let now = Instant::now();
+            let mut deadline = next_sample;
+            if !self.panel_off {
+                for b in self.backlights() {
+                    if let Some(t) = b.channel.next_frame() {
+                        deadline = deadline.min(t);
+                    }
+                }
+            }
+            let fd = self.screen_notify.as_ref().map(Attr::fd);
+            match sys::wait_notify(fd, deadline.saturating_duration_since(now)) {
+                Ok(true) => {
+                    // Re-arm, then see whether it was us.
+                    if let Some(n) = &self.screen_notify {
+                        let _ = n.read_int();
+                    }
+                    self.check(Which::Screen);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("autobrightd: poll: {e}");
+                    exit(1);
+                }
+            }
+
+            let now = Instant::now();
+            if now >= next_sample {
+                self.sample(now);
+                next_sample = if self.panel_off {
+                    now + DPMS_OFF_CHECK
+                } else if next_sample + SAMPLE > now {
+                    next_sample + SAMPLE
+                } else {
+                    now + SAMPLE
+                };
+            }
+            if !self.panel_off {
+                self.frames(Instant::now());
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Which {
+    Screen,
+    Kbd,
+}
+
+fn main() {
+    let mut verbose = false;
+    let mut dry_run = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-v" => verbose = true,
+            "-n" => dry_run = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return;
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                exit(2);
+            }
+        }
+    }
+    match Daemon::open(verbose, dry_run) {
+        Ok(mut d) => d.run(),
+        Err(e) => {
+            eprintln!("autobrightd: {e}");
+            exit(1);
+        }
+    }
+}

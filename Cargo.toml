@@ -1,5 +1,5 @@
 [workspace]
-members = ["mediakeyd"]
+members = ["autobrightd", "mediakeyd"]
 resolver = "3"
 
 [workspace.package]
