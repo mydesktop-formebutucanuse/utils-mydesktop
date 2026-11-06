@@ -57,19 +57,20 @@ pub struct Motion {
 
 /// Brightness changes are measured as ratios of (brightness + this much of
 /// the maximum). Pure ratios would make the bottom of the range endless:
-/// from 1/16 nit to 2 nits is as far as from 16 to 500. But the eye needs
+/// from 1/64 nit to 2 nits is as far as from 4 to 500. But the eye needs
 /// bigger steps to notice anything in the dark, and the panel does not even
 /// change below 2 nits (the driver gives those its lowest level), so the
 /// dark end is compressed. 3 % is 15 nits on a 500-nit screen.
 pub const DARK_PCT: f32 = 3.0;
 
-/// The screen moves at most about 0.3 % per write. Writes come about every
-/// 48 ms (the DCP driver takes 43 to 47 ms each), and around 20 Hz the eye
-/// picks up a brightness step of roughly 1 % on a large bright field: 1 %
-/// steps did show. Top speed is reached, and given up, over 1.5 s. A small
-/// change takes about 1.5 s, 140 to 315 nits about 15 s, 25 % to 100 %
-/// about 25 s, and the lowest setting to 25 % about 40 s.
-pub const SCREEN_MOTION: Motion = Motion { speed: 0.0027 / 0.048, accel: 0.0027 / 0.048 / 1.5 };
+/// The screen moves at most 5.6 % per second: about 0.1 % per write at 60
+/// writes a second (the kernel patches), 0.27 % at the 21 the DCP driver
+/// takes without them. Around 20 Hz the eye picks up a brightness step of
+/// roughly 1 % on a large bright field: 1 % steps did show. Top speed is
+/// reached, and given up, over 1.5 s. A small change takes about 1.5 s,
+/// 140 to 315 nits about 15 s, 25 % to 100 % about 25 s, and the lowest
+/// setting to 25 % about 40 s.
+pub const SCREEN_MOTION: Motion = Motion { speed: 0.05625, accel: 0.05625 / 1.5 };
 /// Nobody watches the keyboard fade, and from off every unit is a large
 /// ratio, so it moves much faster: off to 75 % in about 4 s.
 pub const KBD_MOTION: Motion = Motion { speed: 1.0, accel: 1.0 };
@@ -78,18 +79,21 @@ pub const KBD_MOTION: Motion = Motion { speed: 1.0, accel: 1.0 };
 /// presses, evenly spaced in the same ratio space as transitions, so every
 /// press looks the same size (macOS has 16 steps too).
 pub const KEY_STEPS: f32 = 16.0;
-/// A press glides there in about 0.65 s, in steps of at most 2 % per write
-/// (about 14 writes), easing in and out over 0.15 s; 6-7 % steps looked
-/// choppy. Held down, the key sweeps the whole range in about 8 s.
-pub const KEY_MOTION: Motion = Motion { speed: 0.02 / 0.048, accel: 0.02 / 0.048 / 0.15 };
+/// A press glides there in about 0.65 s, easing in and out over 0.15 s:
+/// about 38 writes of at most 0.7 % with the kernel patches (2 % without
+/// them already looked smooth enough; 6-7 % looked choppy). Held down, the
+/// key sweeps the whole range in about 8 s.
+pub const KEY_MOTION: Motion = Motion { speed: 0.4167, accel: 0.4167 / 0.15 };
 /// Presses may run at most this many steps ahead of the brightness, so it
 /// stops soon after the key is let go.
 const KEY_LEAD: f32 = 2.0;
 
-/// Time between writes while a change runs, about 22 a second. A screen
-/// write takes about this long anyway: the Apple DCP driver sleeps 42 ms and
-/// runs a display commit under the backlight lock (43 to 47 ms measured).
-pub const FRAME: Duration = Duration::from_millis(45);
+/// Time between writes while a change runs, about 60 a second. With the
+/// kernel patches (../kernel) a screen write returns at once and the driver
+/// shows it within a frame or two at 120 Hz. Without them each write takes
+/// 43 to 47 ms (the Apple DCP driver sleeps 42 ms and commits under the
+/// backlight lock), so writes come about 21 a second however short this is.
+pub const FRAME: Duration = Duration::from_millis(16);
 /// Pause after each write before the next frame looks at the file. A write
 /// by someone else that waited for the lock gets it in that time, so the
 /// next frame sees it instead of overwriting it.
@@ -179,9 +183,8 @@ impl LuxFilter {
 /// turn around slows down first.
 ///
 /// The brightness file takes whole units, so each write is the nearest one
-/// to where the motion is. With the 1/16-nit kernel patch (../kernel) that
-/// is fine enough not to show; with whole nits, slow parts move in 1-nit
-/// steps.
+/// to where the motion is. With the kernel patches (1/64 nit) that is fine
+/// enough not to show; with whole nits, slow parts move in 1-nit steps.
 pub struct Ramp {
     pub to: u32,
     pub motion: Motion,
@@ -393,12 +396,14 @@ impl Channel {
 mod tests {
     use super::*;
 
-    /// A screen write as measured on the M1 Pro.
-    const SCREEN_WRITE: Duration = Duration::from_millis(46);
+    /// A screen write with the kernel patches: it returns at once.
+    const SCREEN_WRITE: Duration = Duration::from_millis(1);
+    /// A screen write without them, as measured on the M1 Pro.
+    const BLOCKING_WRITE: Duration = Duration::from_millis(46);
 
-    /// Screen units with the kernel patch: 1/16 nit, 8000 at 500 nits.
+    /// Screen units with the kernel patches: 1/64 nit, 32000 at 500 nits.
     fn nits(n: u32) -> u32 {
-        n * 16
+        n * 64
     }
 
     fn screen(current: u32) -> Channel {
@@ -526,12 +531,12 @@ mod tests {
         assert!(y > 100.0, "{y}");
     }
 
-    /// Largest written step allowed on the screen, in percent: 0.3 % plus
-    /// rounding to whole 1/16-nit units (0.05 % at 125 nits).
-    const MAX_PCT: f32 = 0.36;
+    /// Largest written step allowed on the screen, in percent: 0.1 % plus
+    /// rounding to whole 1/64-nit units (0.0125 % at 125 nits).
+    const MAX_PCT: f32 = 0.12;
 
     #[test]
-    fn screen_steps_stay_under_0_3_percent() {
+    fn screen_steps_stay_under_0_1_percent() {
         let t = Instant::now();
         let mut ch = screen(nits(140));
         start_change(&mut ch, nits(315), t);
@@ -580,13 +585,13 @@ mod tests {
         let (last_t, last_v) = *w.last().unwrap();
         assert_eq!(last_v, nits(125));
         assert!(last_t < 45.0, "{last_t}");
-        // Steps shrink as it gets brighter: 1/16 nit is 0.6 % at 10 nits,
+        // Steps shrink as it gets brighter: 1/64 nit is 0.16 % at 10 nits,
         // where the eye needs a few percent; above 100 nits they are as
         // small as anywhere.
         let above = |n: u32| -> Vec<(f32, u32)> { w.iter().copied().filter(|x| x.1 > nits(n)).collect() };
         let (b10, b100) = (above(10), above(100));
-        assert!(step_pcts(b10[0].1, &b10[1..]).iter().all(|&p| p < 1.5));
-        assert!(step_pcts(b100[0].1, &b100[1..]).iter().all(|&p| p < 0.4));
+        assert!(step_pcts(b10[0].1, &b10[1..]).iter().all(|&p| p < 0.4));
+        assert!(step_pcts(b100[0].1, &b100[1..]).iter().all(|&p| p < 0.13));
     }
 
     #[test]
@@ -643,7 +648,7 @@ mod tests {
         let mid = t + Duration::from_secs(6);
         let before = run_until(&mut ch, t, mid);
         // At full speed, now asked to stop just ahead.
-        let near = before.last().unwrap().1 + 16;
+        let near = before.last().unwrap().1 + nits(1);
         start_target(&mut ch, near);
         let after = run(&mut ch, t, SCREEN_WRITE);
         assert!(after.iter().all(|w| w.1 <= near), "{after:?}");
@@ -692,8 +697,8 @@ mod tests {
         assert_eq!(w.last().unwrap().1, to);
         let last_t = w.last().unwrap().0;
         assert!(last_t > 0.5 && last_t < 0.8, "{last_t} {w:?}");
-        assert!(w.len() >= 10, "{w:?}");
-        assert!(step_pcts(nits(300), &w).iter().all(|&p| p < 2.3), "{w:?}");
+        assert!(w.len() >= 30, "{w:?}");
+        assert!(step_pcts(nits(300), &w).iter().all(|&p| p < 0.8), "{w:?}");
         assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
         // A manual change: the light is left alone until it changes a lot.
         assert_eq!(ch.update(12.0, 30.0, t), Update::Nothing);
@@ -721,9 +726,9 @@ mod tests {
         let end = writes.last().unwrap().0;
         assert!(end - release < 1.2, "{end} {release}");
         assert!(writes.windows(2).all(|p| p[0].1 < p[1].1));
-        // 2 % a write in the motion space (more in plain ratios at 20 nits,
-        // where the eye needs it).
-        assert!(motion_pcts(nits(20), &writes).iter().all(|&p| p < 2.1), "{writes:?}");
+        // 0.7 % a write in the motion space (more in plain ratios at 20
+        // nits, where the eye needs it).
+        assert!(motion_pcts(nits(20), &writes).iter().all(|&p| p < 0.75), "{writes:?}");
         // About 0.42 ln units a second: well up, but not at the top yet.
         assert!(ch.known > nits(100) && ch.known < nits(500), "{}", ch.known);
     }
@@ -739,13 +744,30 @@ mod tests {
     }
 
     #[test]
+    fn without_the_kernel_patches_a_change_takes_as_long() {
+        // Writes then block for 46 ms, so there are a third as many, each
+        // three times the size, as small as before the patches.
+        let t = Instant::now();
+        let mut ch = screen(nits(140));
+        start_change(&mut ch, nits(315), t);
+        let fast = run(&mut ch, t, SCREEN_WRITE);
+        let mut ch = screen(nits(140));
+        start_change(&mut ch, nits(315), t);
+        let slow = run(&mut ch, t, BLOCKING_WRITE);
+        let (fast_t, slow_t) = (fast.last().unwrap().0, slow.last().unwrap().0);
+        assert!((fast_t - slow_t).abs() < 0.2, "{fast_t} {slow_t}");
+        assert!(slow.len() * 5 / 2 < fast.len(), "{} {}", slow.len(), fast.len());
+        assert!(step_pcts(nits(140), &slow).iter().all(|&p| p < 0.36));
+    }
+
+    #[test]
     fn writes_wait_for_the_previous_one() {
         let t = Instant::now();
         let mut ch = screen(nits(300));
         start_change(&mut ch, nits(150), t);
         let (at, v) = first_write(&mut ch);
         ch.wrote(v);
-        let after = at + SCREEN_WRITE + WRITE_GAP;
+        let after = at + BLOCKING_WRITE + WRITE_GAP;
         ch.not_before(after);
         assert!(ch.next_frame().unwrap() >= after);
         assert_eq!(ch.frame(after - Duration::from_millis(1)), None);
@@ -765,7 +787,8 @@ mod tests {
         assert_eq!(w.last().unwrap().1, 191);
         let last_t = w.last().unwrap().0;
         assert!(last_t > 3.0 && last_t < 6.0, "{last_t}");
-        assert!(w.windows(2).all(|p| p[1].0 - p[0].0 >= 0.0449), "{w:?}");
+        let frame = FRAME.as_secs_f32() - 1e-4;
+        assert!(w.windows(2).all(|p| p[1].0 - p[0].0 >= frame), "{w:?}");
     }
 
     #[test]

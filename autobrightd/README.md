@@ -17,14 +17,16 @@ writes less often, and changes brightness in steps too small to see:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | at most 0.3 % a write, easing in and out; with the [kernel patch](../kernel), 140 → 315 nits took 296 writes over 14 s, 0.27 % on average (measured, before the dark offset) |
+| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | at most 5.6 % a second, easing in and out; with the [kernel patches](../kernel), 140 → 315 nits is about 920 writes over 15 s, 0.1 % at most (without them about 300, 0.27 %) |
 | Runs as | root | your user (udev rule below) |
 
-Writes matter: every screen write makes the Apple DCP driver sleep 42 ms
-and run a display commit, and the kernel sends a uevent for it. Measured
-on an M1 Pro, one write takes 43 to 47 ms, so a 33 ms tick plus a write is
-about 77 ms, not 33. The driver holds a lock while it sleeps, so writes
-cannot overlap: about 21 a second is the limit.
+Writes matter: without the [kernel patches](../kernel), every screen write
+makes the Apple DCP driver sleep 42 ms and run a display commit, and the
+kernel sends a uevent for it. Measured on an M1 Pro, one write takes 43 to
+47 ms, so a 33 ms tick plus a write is about 77 ms, not 33. The driver
+holds a lock while it sleeps, so writes cannot overlap: about 21 a second
+is the limit. With the patches a write returns at once and the driver
+takes about 60 a second.
 
 ## How it works
 
@@ -38,10 +40,13 @@ cannot overlap: about 21 a second is the limit.
 - **Dead band.** A new target is acted on only if it is at least 2 % of
   `max_brightness` away from the current one, or if it is 0.
 - **Transitions.** Around 20 Hz the eye picks up a brightness step of
-  roughly 1 % on a large bright field, and the DCP driver takes only about
-  21 writes a second, so the only way to make a change invisible is to make
-  each step small. A change moves at no more than about 0.3 % per write,
-  speeding up over the first 1.5 s and slowing down over the last. It is
+  roughly 1 % on a large bright field, so the only way to make a change
+  invisible is to make each step small. A change moves at no more than
+  5.6 % a second, speeding up over the first 1.5 s and slowing down over
+  the last. It writes up to 60 times a second, so that is 0.1 % per write
+  with the [kernel patches](../kernel); without them the DCP driver takes
+  only about 21 writes a second, and the same change takes as long in
+  steps of 0.27 %. It is
   measured in ratios of (brightness + 3 % of the maximum): ratios because
   that is what the eye sees, the 3 % because in the dark the eye needs
   bigger steps and the panel shows nothing below 2 nits, so pure ratios
@@ -51,15 +56,15 @@ cannot overlap: about 21 a second is the limit.
   rises from the first moment. A new target during a change keeps the
   speed it has; one in the other direction slows down first, and nothing
   overshoots. Each write is the nearest whole value, which needs the
-  [kernel patch](../kernel) (1/16 nit) to stay smooth; with whole nits the
-  slow parts move in 1-nit steps. The keyboard moves much faster (off to
+  kernel patch for 1/64 nit to stay smooth; with whole nits the slow parts
+  move in 1-nit steps. The keyboard moves much faster (off to
   75 % in about 4 s): nobody watches it fade.
 - **Brightness keys.** The [backlight](../backlight) command sends SIGUSR1
   (brighter) or SIGUSR2 (dimmer). Each press moves the screen 1/16 of the
   way between 2 nits and the maximum in the same ratio space as
   transitions, so every press looks the same size, and the screen glides
-  there in about 0.65 s, in steps of at most 2 % per write that ease in and
-  out. Held down (key repeat), it moves steadily and sweeps the whole range
+  there in about 0.65 s, easing in and out: about 39 writes of at most
+  0.7 % with the kernel patches, 13 of at most 2 % without. Held down (key repeat), it moves steadily and sweeps the whole range
   in about 8 s; presses never run more than two steps ahead, so it stops
   within a second of letting go. Like any manual change, the light is then
   left alone until it changes a lot.
@@ -69,10 +74,11 @@ cannot overlap: about 21 a second is the limit.
   then left alone until the light shifts by 75 % and at least 5 lux; then it
   ramps from your value to the automatic one. The screen is watched through
   the kernel's change notification; the keyboard (LED class, which has none)
-  is checked with every sample. During a transition a key press usually
-  waits for the backlight lock and lands right after one of our writes, so
-  each write is read back (a different value means a manual change) and the
-  next frame waits 1 ms, by which time a waiting write is in place.
+  is checked with every sample. Without the kernel patches, a write by
+  someone else during a transition usually waits for the backlight lock and
+  lands right after one of ours, so each write is read back (a different
+  value means a manual change) and the next frame waits 1 ms, by which time
+  a waiting write is in place.
 - **Power source.** The AC boost needs to know whether the charger is
   connected. `macsmc-ac/online` cannot tell on an M1 Pro: it drops to 0 for
   about 0.4 s when the cable goes in or out and reads 1 otherwise, so a

@@ -319,9 +319,10 @@ impl Daemon {
             match b.attr.write_u32(value) {
                 Ok(()) => {
                     b.channel.wrote(value);
-                    // Each write holds the backlight lock for about 45 ms. A
-                    // key press that waited for it may already have replaced
-                    // our value; if so, that is a manual change.
+                    // Without the kernel patches each write holds the
+                    // backlight lock for about 45 ms, and a write by someone
+                    // else that waited for it may already have replaced our
+                    // value; if so, that is a manual change.
                     let stored = b.attr.read_u32().unwrap_or(value);
                     b.channel.not_before(Instant::now() + logic::WRITE_GAP);
                     if verbose {
