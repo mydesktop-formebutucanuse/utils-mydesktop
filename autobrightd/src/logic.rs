@@ -29,6 +29,9 @@ pub const SCREEN_CURVE: Curve = &[
 pub const KBD_CURVE: Curve = &[(0.0, 75.0), (5.0, 50.0), (20.0, 25.0), (50.0, 0.0)];
 
 pub const SCREEN_FLOOR_PCT: f32 = 25.0;
+/// The Apple panel shows everything up to 2 nits the same: the driver gives
+/// 0 to 2 nits its lowest level. 2 nits of a 500-nit maximum is 0.4 %.
+pub const SCREEN_DEAD_PCT: f32 = 0.4;
 pub const KBD_FLOOR_PCT: f32 = 0.0;
 /// Added to the screen percentage while on AC.
 pub const AC_SCREEN_BOOST_PCT: f32 = 30.0;
@@ -105,6 +108,9 @@ pub struct Settings {
     pub floor_pct: f32,
     pub max: u32,
     pub motion: Motion,
+    /// Values up to this one all look the same, so a change starting below
+    /// it starts here instead (0 if there is no such range).
+    pub dead_zone: u32,
 }
 
 /// The brightness the curve asks for, in device units.
@@ -175,8 +181,10 @@ pub struct Ramp {
 }
 
 impl Ramp {
-    pub fn new(from: u32, to: u32, max: u32, now: Instant) -> Ramp {
-        let off = (max as f32 * DARK_PCT / 100.0).max(1.0);
+    pub fn new(from: u32, to: u32, s: &Settings, now: Instant) -> Ramp {
+        let off = (s.max as f32 * DARK_PCT / 100.0).max(1.0);
+        // Below the dead zone nothing shows; start rising at its top.
+        let from = if from < s.dead_zone && to > s.dead_zone { s.dead_zone } else { from };
         let pos = (from as f32 + off).ln();
         Ramp { to, off, pos, speed: 0.0, last: now, next_at: now }
     }
@@ -267,7 +275,7 @@ impl Channel {
             match &mut self.ramp {
                 // Only where it heads changes; position, speed and beat stay.
                 Some(ramp) => ramp.to = want,
-                None => self.ramp = Some(Ramp::new(self.known, want, self.settings.max, now)),
+                None => self.ramp = Some(Ramp::new(self.known, want, &self.settings, now)),
             }
             result = Update::Moving(want);
         }
@@ -332,7 +340,13 @@ mod tests {
     fn screen(current: u32) -> Channel {
         Channel::new(
             "screen",
-            Settings { curve: SCREEN_CURVE, floor_pct: SCREEN_FLOOR_PCT, max: nits(500), motion: SCREEN_MOTION },
+            Settings {
+                curve: SCREEN_CURVE,
+                floor_pct: SCREEN_FLOOR_PCT,
+                max: nits(500),
+                motion: SCREEN_MOTION,
+                dead_zone: nits(2),
+            },
             current,
         )
     }
@@ -363,7 +377,7 @@ mod tests {
 
     fn start_change(ch: &mut Channel, to: u32, t: Instant) {
         ch.target = to;
-        ch.ramp = Some(Ramp::new(ch.known, to, ch.settings.max, t));
+        ch.ramp = Some(Ramp::new(ch.known, to, &ch.settings, t));
     }
 
     /// Runs frames as the daemon would until `until`; returns the writes.
@@ -400,7 +414,13 @@ mod tests {
 
     #[test]
     fn floor_and_ac_boost() {
-        let s = Settings { curve: SCREEN_CURVE, floor_pct: SCREEN_FLOOR_PCT, max: 500, motion: SCREEN_MOTION };
+        let s = Settings {
+            curve: SCREEN_CURVE,
+            floor_pct: SCREEN_FLOOR_PCT,
+            max: 500,
+            motion: SCREEN_MOTION,
+            dead_zone: 2,
+        };
         assert_eq!(desired(&s, 0.0, 0.0), 125);
         assert_eq!(desired(&s, 300.0, 0.0), 350);
         assert_eq!(desired(&s, 300.0, AC_SCREEN_BOOST_PCT), 500);
@@ -472,13 +492,15 @@ mod tests {
 
     #[test]
     fn climbing_out_of_the_lowest_setting_shows_soon() {
-        // Up to 2 nits the panel does not change, so get past that fast.
+        // Up to 2 nits the panel does not change: the change starts at
+        // 2 nits (an invisible jump) and rises from the first moments.
         let t = Instant::now();
         let mut ch = screen(1);
         start_change(&mut ch, nits(125), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
+        assert_eq!(w[0], (0.0, nits(2)));
         let visible = w.iter().find(|x| x.1 > nits(2)).unwrap().0;
-        assert!(visible < 3.5, "{visible}");
+        assert!(visible < 0.6, "{visible}");
         let (last_t, last_v) = *w.last().unwrap();
         assert_eq!(last_v, nits(125));
         assert!(last_t < 45.0, "{last_t}");
@@ -577,7 +599,7 @@ mod tests {
         let t = Instant::now();
         let mut kbd = Channel::new(
             "kbd",
-            Settings { curve: KBD_CURVE, floor_pct: KBD_FLOOR_PCT, max: 255, motion: KBD_MOTION },
+            Settings { curve: KBD_CURVE, floor_pct: KBD_FLOOR_PCT, max: 255, motion: KBD_MOTION, dead_zone: 0 },
             0,
         );
         assert_eq!(kbd.update(0.0, 0.0, t), Update::Moving(191));

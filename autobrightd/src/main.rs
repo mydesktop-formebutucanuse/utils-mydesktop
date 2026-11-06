@@ -109,11 +109,13 @@ impl Daemon {
         let als = Attr::open(als_dir.join("in_illuminance_input"), false)
             .map_err(|e| format!("{}: {e}", als_dir.display()))?;
 
+        let screen_max = max_brightness(SCREEN_DIR)?;
         let screen_settings = Settings {
             curve: logic::SCREEN_CURVE,
             floor_pct: logic::SCREEN_FLOOR_PCT,
             motion: logic::SCREEN_MOTION,
-            max: max_brightness(SCREEN_DIR)?,
+            max: screen_max,
+            dead_zone: (screen_max as f32 * logic::SCREEN_DEAD_PCT / 100.0) as u32,
         };
         let screen = open_backlight("screen", SCREEN_DIR, screen_settings, write)?;
         let screen_notify = Attr::open(Path::new(SCREEN_DIR).join("actual_brightness"), false).ok();
@@ -129,6 +131,7 @@ impl Daemon {
                     floor_pct: logic::KBD_FLOOR_PCT,
                     max,
                     motion: logic::KBD_MOTION,
+                    dead_zone: 0,
                 };
                 Some(open_backlight("kbd", KBD_DIR, settings, write)?)
             }

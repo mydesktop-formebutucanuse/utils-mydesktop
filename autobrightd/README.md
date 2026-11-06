@@ -47,12 +47,13 @@ cannot overlap: about 21 a second is the limit.
   bigger steps and the panel shows nothing below 2 nits, so pure ratios
   would crawl there for minutes. Its length follows its size: about 1.5 s
   for a small change, 15 s for 140 to 315 nits, 25 s for 25 % to 100 %;
-  from the lowest setting it is visibly brighter after 3 s. A new target
-  during a change keeps the speed it has; one in the other direction slows
-  down first, and nothing overshoots. Each write is the nearest whole
-  value, which needs the [kernel patch](../kernel) (1/16 nit) to stay
-  smooth; with whole nits the slow parts move in 1-nit steps. The keyboard
-  moves much faster (off to 75 % in about 4 s): nobody watches it fade.
+  from below 2 nits it starts at 2 nits, which looks the same, so it
+  rises from the first moment. A new target during a change keeps the
+  speed it has; one in the other direction slows down first, and nothing
+  overshoots. Each write is the nearest whole value, which needs the
+  [kernel patch](../kernel) (1/16 nit) to stay smooth; with whole nits the
+  slow parts move in 1-nit steps. The keyboard moves much faster (off to
+  75 % in about 4 s): nobody watches it fade.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is

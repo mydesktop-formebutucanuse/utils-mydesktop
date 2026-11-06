@@ -14,5 +14,7 @@ backlight kbd +10       # /sys/class/leds/kbd_backlight
 backlight kbd -10
 ```
 
-The screen never goes below 1, because 0 turns some panels off completely.
+The screen stops at 0.4 % of its maximum (at least 1): 2 nits on a 500-nit
+Apple panel, whose driver shows everything from 0 to 2 nits at the same
+lowest level.
 [mediakeyd](../mediakeyd) uses it for the brightness keys.
