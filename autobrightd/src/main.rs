@@ -8,6 +8,16 @@
 //! screen changes are noticed through sysfs_notify() on actual_brightness,
 //! and plugging or unplugging the charger through kernel uevents.
 
+/// eprintln! that ignores errors. With panic = "abort", a closed or broken
+/// stderr (say, the terminal that started the session is gone) would
+/// otherwise kill the daemon at its next message.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod logic;
 mod sys;
 
@@ -140,17 +150,17 @@ impl Daemon {
         };
         if verbose {
             let path = |a: &Option<Attr>| a.as_ref().map_or("(none)".into(), |a| a.path.display().to_string());
-            eprintln!("autobrightd: als {}", d.als.path.display());
-            eprintln!("autobrightd: screen {} max {}", d.screen.attr.path.display(), d.screen.channel.settings.max);
+            say!("autobrightd: als {}", d.als.path.display());
+            say!("autobrightd: screen {} max {}", d.screen.attr.path.display(), d.screen.channel.settings.max);
             match &d.kbd {
-                Some(k) => eprintln!("autobrightd: kbd {} max {}", k.attr.path.display(), k.channel.settings.max),
-                None => eprintln!("autobrightd: kbd (none)"),
+                Some(k) => say!("autobrightd: kbd {} max {}", k.attr.path.display(), k.channel.settings.max),
+                None => say!("autobrightd: kbd (none)"),
             }
             let how = if d.uevents.is_some() { "on uevents" } else { "polled" };
-            eprintln!("autobrightd: power {} ({how})", path(&d.battery));
-            eprintln!("autobrightd: dpms {}, notify {}", path(&d.dpms), path(&d.screen_notify));
+            say!("autobrightd: power {} ({how})", path(&d.battery));
+            say!("autobrightd: dpms {}, notify {}", path(&d.dpms), path(&d.screen_notify));
             if dry_run {
-                eprintln!("autobrightd: dry run, nothing is written");
+                say!("autobrightd: dry run, nothing is written");
             }
         }
         Ok(d)
@@ -158,7 +168,7 @@ impl Daemon {
 
     fn log(&self, msg: std::fmt::Arguments) {
         if self.verbose {
-            eprintln!("autobrightd: {msg}");
+            say!("autobrightd: {msg}");
         }
     }
 
@@ -178,7 +188,7 @@ impl Daemon {
             && b.channel.observe(v, lux)
             && verbose
         {
-            eprintln!("autobrightd: {} set to {v} by someone else, holding until the light changes", b.channel.name);
+            say!("autobrightd: {} set to {v} by someone else, holding until the light changes", b.channel.name);
         }
     }
 
@@ -246,10 +256,10 @@ impl Daemon {
                 continue;
             }
             if update == Update::Resumed {
-                eprintln!("autobrightd: {}: light changed (lux {lux:.0}), automatic again", b.channel.name);
+                say!("autobrightd: {}: light changed (lux {lux:.0}), automatic again", b.channel.name);
             }
             if let Update::Moving(to) = update {
-                eprintln!(
+                say!(
                     "autobrightd: lux {raw:.0} (smoothed {lux:.0}): {} {} -> {to}",
                     b.channel.name, b.channel.known
                 );
@@ -289,7 +299,7 @@ impl Daemon {
             if dry_run {
                 b.channel.wrote(value);
                 if verbose {
-                    eprintln!("autobrightd: would write {} {value}", b.channel.name);
+                    say!("autobrightd: would write {} {value}", b.channel.name);
                 }
                 continue;
             }
@@ -304,17 +314,17 @@ impl Daemon {
                     b.channel.not_before(Instant::now() + logic::WRITE_GAP);
                     if verbose {
                         let ms = started.elapsed().as_millis();
-                        eprintln!("autobrightd: {} {value} ({ms} ms)", b.channel.name);
+                        say!("autobrightd: {} {value} ({ms} ms)", b.channel.name);
                     }
                     if stored != value && b.channel.observe(stored, lux) && verbose {
-                        eprintln!(
+                        say!(
                             "autobrightd: {} set to {stored} by someone else, holding until the light changes",
                             b.channel.name
                         );
                     }
                 }
                 Err(e) => {
-                    eprintln!("autobrightd: writing {}: {e}", b.attr.path.display());
+                    say!("autobrightd: writing {}: {e}", b.attr.path.display());
                     b.channel.stop();
                 }
             }
@@ -341,7 +351,7 @@ impl Daemon {
             let ready = match sys::wait(notify, uevent, deadline.saturating_duration_since(now)) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("autobrightd: poll: {e}");
+                    say!("autobrightd: poll: {e}");
                     exit(1);
                 }
             };
@@ -397,7 +407,7 @@ fn main() {
                 return;
             }
             _ => {
-                eprintln!("{USAGE}");
+                say!("{USAGE}");
                 exit(2);
             }
         }
@@ -405,7 +415,7 @@ fn main() {
     match Daemon::open(verbose, dry_run) {
         Ok(mut d) => d.run(),
         Err(e) => {
-            eprintln!("autobrightd: {e}");
+            say!("autobrightd: {e}");
             exit(1);
         }
     }
