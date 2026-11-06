@@ -41,8 +41,9 @@ pub const LUX_ALPHA: f32 = 0.28;
 /// max_brightness) from the current one, so lux noise causes no writes.
 pub const DEADBAND_PCT: u32 = 2;
 
-/// How fast a channel's brightness may change, in ln(1 + units): ratios,
-/// since that is what the eye sees.
+/// How fast a channel's brightness may change, in ln(units + DARK_PCT % of
+/// the maximum): ratios, since that is what the eye sees, with the dark end
+/// compressed (see DARK_PCT).
 #[derive(Clone, Copy)]
 pub struct Motion {
     /// Top speed, per second.
@@ -51,14 +52,23 @@ pub struct Motion {
     pub accel: f32,
 }
 
-/// The screen moves at most 0.3 % per write. Writes come about every 48 ms
-/// (the DCP driver takes 43 to 47 ms each), and around 20 Hz the eye picks
-/// up a brightness step of roughly 1 % on a large bright field: 1 % steps
-/// did show. Top speed is reached, and given up, over 1.5 s. A small change
-/// takes about 1.5 s, 140 to 315 nits about 14 s, 25 % to 100 % about 24 s.
-pub const SCREEN_MOTION: Motion = Motion { speed: 0.003 / 0.048, accel: 0.003 / 0.048 / 1.5 };
+/// Brightness changes are measured as ratios of (brightness + this much of
+/// the maximum). Pure ratios would make the bottom of the range endless:
+/// from 1/16 nit to 2 nits is as far as from 16 to 500. But the eye needs
+/// bigger steps to notice anything in the dark, and the panel does not even
+/// change below 2 nits (the driver gives those its lowest level), so the
+/// dark end is compressed. 3 % is 15 nits on a 500-nit screen.
+pub const DARK_PCT: f32 = 3.0;
+
+/// The screen moves at most about 0.3 % per write. Writes come about every
+/// 48 ms (the DCP driver takes 43 to 47 ms each), and around 20 Hz the eye
+/// picks up a brightness step of roughly 1 % on a large bright field: 1 %
+/// steps did show. Top speed is reached, and given up, over 1.5 s. A small
+/// change takes about 1.5 s, 140 to 315 nits about 15 s, 25 % to 100 %
+/// about 25 s, and the lowest setting to 25 % about 40 s.
+pub const SCREEN_MOTION: Motion = Motion { speed: 0.0027 / 0.048, accel: 0.0027 / 0.048 / 1.5 };
 /// Nobody watches the keyboard fade, and from off every unit is a large
-/// ratio, so it moves much faster: off to 75 % in about 6 s.
+/// ratio, so it moves much faster: off to 75 % in about 4 s.
 pub const KBD_MOTION: Motion = Motion { speed: 1.0, accel: 1.0 };
 
 /// Time between writes while a change runs, about 22 a second. A screen
@@ -144,7 +154,8 @@ impl LuxFilter {
 }
 
 /// A running change: where the brightness is and how fast it moves, in
-/// ln(1 + units), heading for `to` within the channel's Motion limits. It
+/// ln(units + dark offset), heading for `to` within the channel's Motion
+/// limits. It
 /// speeds up and slows down gently and never overshoots. A new target only
 /// changes where it heads: the speed carries on, and a change that has to
 /// turn around slows down first.
@@ -155,6 +166,8 @@ impl LuxFilter {
 /// steps.
 pub struct Ramp {
     pub to: u32,
+    /// The dark offset in units (DARK_PCT of the maximum).
+    off: f32,
     pos: f32,
     speed: f32,
     last: Instant,
@@ -162,8 +175,10 @@ pub struct Ramp {
 }
 
 impl Ramp {
-    pub fn new(from: u32, to: u32, now: Instant) -> Ramp {
-        Ramp { to, pos: (from as f32).ln_1p(), speed: 0.0, last: now, next_at: now }
+    pub fn new(from: u32, to: u32, max: u32, now: Instant) -> Ramp {
+        let off = (max as f32 * DARK_PCT / 100.0).max(1.0);
+        let pos = (from as f32 + off).ln();
+        Ramp { to, off, pos, speed: 0.0, last: now, next_at: now }
     }
 
     /// Current speed, in ln units per second.
@@ -178,7 +193,7 @@ impl Ramp {
         // A long gap (a suspend, say) must not turn into one big step.
         let dt = now.saturating_duration_since(self.last).as_secs_f32().min(0.25);
         self.last = now;
-        let target = (self.to as f32).ln_1p();
+        let target = (self.to as f32 + self.off).ln();
         let dist = target - self.pos;
         let dir = dist.signum();
         // As fast as allowed, but no faster than it can still stop in time.
@@ -191,7 +206,7 @@ impl Ramp {
             return (self.to, true);
         }
         self.pos = pos;
-        (pos.exp_m1().round().max(0.0) as u32, false)
+        ((pos.exp() - self.off).round().max(0.0) as u32, false)
     }
 }
 
@@ -252,7 +267,7 @@ impl Channel {
             match &mut self.ramp {
                 // Only where it heads changes; position, speed and beat stay.
                 Some(ramp) => ramp.to = want,
-                None => self.ramp = Some(Ramp::new(self.known, want, now)),
+                None => self.ramp = Some(Ramp::new(self.known, want, self.settings.max, now)),
             }
             result = Update::Moving(want);
         }
@@ -348,7 +363,7 @@ mod tests {
 
     fn start_change(ch: &mut Channel, to: u32, t: Instant) {
         ch.target = to;
-        ch.ramp = Some(Ramp::new(ch.known, to, t));
+        ch.ramp = Some(Ramp::new(ch.known, to, ch.settings.max, t));
     }
 
     /// Runs frames as the daemon would until `until`; returns the writes.
@@ -427,7 +442,7 @@ mod tests {
         let w = run(&mut ch, t, SCREEN_WRITE);
         let (last_t, last_v) = *w.last().unwrap();
         assert_eq!(last_v, nits(315));
-        assert!(last_t > 12.0 && last_t < 16.0, "{last_t}");
+        assert!(last_t > 12.0 && last_t < 17.0, "{last_t}");
         assert!(w.windows(2).all(|p| p[0].1 < p[1].1));
         let pcts = step_pcts(nits(140), &w);
         assert!(pcts.iter().all(|&p| p < MAX_PCT), "{pcts:?}");
@@ -453,6 +468,27 @@ mod tests {
         assert_eq!(w.last().unwrap().1, nits(125));
         assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
         assert!(step_pcts(nits(500), &w).iter().all(|&p| p < MAX_PCT));
+    }
+
+    #[test]
+    fn climbing_out_of_the_lowest_setting_shows_soon() {
+        // Up to 2 nits the panel does not change, so get past that fast.
+        let t = Instant::now();
+        let mut ch = screen(1);
+        start_change(&mut ch, nits(125), t);
+        let w = run(&mut ch, t, SCREEN_WRITE);
+        let visible = w.iter().find(|x| x.1 > nits(2)).unwrap().0;
+        assert!(visible < 3.5, "{visible}");
+        let (last_t, last_v) = *w.last().unwrap();
+        assert_eq!(last_v, nits(125));
+        assert!(last_t < 45.0, "{last_t}");
+        // Steps shrink as it gets brighter: 1/16 nit is 0.6 % at 10 nits,
+        // where the eye needs a few percent; above 100 nits they are as
+        // small as anywhere.
+        let above = |n: u32| -> Vec<(f32, u32)> { w.iter().copied().filter(|x| x.1 > nits(n)).collect() };
+        let (b10, b100) = (above(10), above(100));
+        assert!(step_pcts(b10[0].1, &b10[1..]).iter().all(|&p| p < 1.5));
+        assert!(step_pcts(b100[0].1, &b100[1..]).iter().all(|&p| p < 0.4));
     }
 
     #[test]
@@ -536,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn the_keyboard_comes_on_in_about_six_seconds() {
+    fn the_keyboard_comes_on_in_a_few_seconds() {
         // LED writes are instant; they still come at most once a frame.
         let t = Instant::now();
         let mut kbd = Channel::new(
@@ -548,7 +584,7 @@ mod tests {
         let w = run(&mut kbd, t, Duration::ZERO);
         assert_eq!(w.last().unwrap().1, 191);
         let last_t = w.last().unwrap().0;
-        assert!(last_t > 5.0 && last_t < 8.0, "{last_t}");
+        assert!(last_t > 3.0 && last_t < 6.0, "{last_t}");
         assert!(w.windows(2).all(|p| p[1].0 - p[0].0 >= 0.0449), "{w:?}");
     }
 

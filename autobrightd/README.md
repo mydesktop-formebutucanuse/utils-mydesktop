@@ -17,7 +17,7 @@ writes less often, and changes brightness in steps too small to see:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | at most 0.3 % a write, easing in and out; with the [kernel patch](../kernel), 140 → 315 nits took 296 writes over 14 s, 0.27 % on average (measured) |
+| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | at most 0.3 % a write, easing in and out; with the [kernel patch](../kernel), 140 → 315 nits took 296 writes over 14 s, 0.27 % on average (measured, before the dark offset) |
 | Runs as | root | your user (udev rule below) |
 
 Writes matter: every screen write makes the Apple DCP driver sleep 42 ms
@@ -40,16 +40,19 @@ cannot overlap: about 21 a second is the limit.
 - **Transitions.** Around 20 Hz the eye picks up a brightness step of
   roughly 1 % on a large bright field, and the DCP driver takes only about
   21 writes a second, so the only way to make a change invisible is to make
-  each step small. A change moves in `ln(1 + brightness)` (ratios, which is
-  what the eye sees) at no more than 0.3 % per write, speeding up over the
-  first 1.5 s and slowing down over the last. Its length follows its size:
-  about 1.5 s for a small change, 14 s for 140 to 315 nits, 24 s for 25 % to
-  100 %. A new target during a change keeps the speed it has; one in the
-  other direction slows down first, and nothing overshoots. Each write is
-  the nearest whole value, which needs the [kernel patch](../kernel) (1/16
-  nit) to stay smooth; with whole nits the slow parts move in 1-nit steps.
-  The keyboard moves much faster (off to 75 % in about 6 s): nobody watches
-  it fade.
+  each step small. A change moves at no more than about 0.3 % per write,
+  speeding up over the first 1.5 s and slowing down over the last. It is
+  measured in ratios of (brightness + 3 % of the maximum): ratios because
+  that is what the eye sees, the 3 % because in the dark the eye needs
+  bigger steps and the panel shows nothing below 2 nits, so pure ratios
+  would crawl there for minutes. Its length follows its size: about 1.5 s
+  for a small change, 15 s for 140 to 315 nits, 25 s for 25 % to 100 %;
+  from the lowest setting it is visibly brighter after 3 s. A new target
+  during a change keeps the speed it has; one in the other direction slows
+  down first, and nothing overshoots. Each write is the nearest whole
+  value, which needs the [kernel patch](../kernel) (1/16 nit) to stay
+  smooth; with whole nits the slow parts move in 1-nit steps. The keyboard
+  moves much faster (off to 75 % in about 4 s): nobody watches it fade.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is
@@ -112,8 +115,8 @@ fi
 ## Tuning
 
 There is no configuration file. Curves, floors, the AC boost, smoothing,
-dead band, transition speeds (`SCREEN_MOTION`, `KBD_MOTION`) and the
-override thresholds are constants at the top of [src/logic.rs](src/logic.rs);
+dead band, transition speeds (`SCREEN_MOTION`, `KBD_MOTION`, `DARK_PCT`) and
+the override thresholds are constants at the top of [src/logic.rs](src/logic.rs);
 device paths and timings are at the top of [src/main.rs](src/main.rs). Edit
 and rebuild.
 
