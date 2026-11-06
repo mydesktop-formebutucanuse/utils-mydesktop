@@ -11,7 +11,8 @@
 //! still receives the key as usual.
 //!
 //! Raw events carry no autorepeat, so keys marked `repeat` are repeated here
-//! with the X server's repeat delay and rate for as long as they are down.
+//! with the X server's repeat delay and rate for as long as they are down;
+//! `repeat=MS` sets the delay before the first repeat for one key.
 //! A key's command never runs twice at the same time: presses that arrive
 //! while it runs are merged into one more run after it finishes.
 
@@ -31,10 +32,20 @@ const CHILD_POLL: Duration = Duration::from_millis(5);
 /// Used when the X server does not report its repeat settings.
 const DEFAULT_REPEAT: (Duration, Duration) = (Duration::from_millis(660), Duration::from_millis(40));
 
+/// Whether and when a key that is held down repeats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Repeat {
+    Once,
+    /// After the X server's repeat delay.
+    ServerDelay,
+    /// After this delay. The interval is still the X server's.
+    After(Duration),
+}
+
 struct Binding {
     name: String,
     keysym: KeySym,
-    repeat: bool,
+    repeat: Repeat,
     command: String,
     child: Option<Child>,
     pending: bool,
@@ -69,7 +80,20 @@ fn split_word(s: &str) -> (&str, &str) {
     }
 }
 
-/// Config lines: `KEYSYM repeat|once COMMAND`, `#` starts a comment line.
+/// The mode word of a config line: `once`, `repeat` or `repeat=MS`.
+fn parse_mode(mode: &str) -> Option<Repeat> {
+    match mode {
+        "once" => Some(Repeat::Once),
+        "repeat" => Some(Repeat::ServerDelay),
+        _ => match mode.strip_prefix("repeat=")?.parse::<u64>() {
+            Ok(ms @ 1..=10_000) => Some(Repeat::After(Duration::from_millis(ms))),
+            _ => None,
+        },
+    }
+}
+
+/// Config lines: `KEYSYM repeat|repeat=MS|once COMMAND`, `#` starts a
+/// comment line.
 fn parse_config(path: &str) -> Result<Vec<Binding>, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let mut bindings = Vec::new();
@@ -82,11 +106,8 @@ fn parse_config(path: &str) -> Result<Vec<Binding>, String> {
         let err = |what: &str| format!("{path}:{}: {what}", n + 1);
         let (name, rest) = split_word(line);
         let (mode, command) = split_word(rest);
-        let repeat = match mode {
-            "repeat" => true,
-            "once" => false,
-            _ => return Err(err("expected `repeat` or `once` after the keysym")),
-        };
+        let repeat = parse_mode(mode)
+            .ok_or_else(|| err("expected `repeat`, `repeat=MS` (1 to 10000) or `once` after the keysym"))?;
         if command.is_empty() {
             return Err(err("missing command"));
         }
@@ -268,8 +289,12 @@ fn main() {
                         eprintln!("mediakeyd: {}", bindings[i].name);
                     }
                     fire(&mut bindings[i]);
-                    if bindings[i].repeat {
-                        let (delay, _) = repeat_rate(dpy);
+                    let delay = match bindings[i].repeat {
+                        Repeat::Once => None,
+                        Repeat::ServerDelay => Some(repeat_rate(dpy).0),
+                        Repeat::After(delay) => Some(delay),
+                    };
+                    if let Some(delay) = delay {
                         held.push(Held { keycode, binding: i, next: Instant::now() + delay });
                     }
                 }
@@ -306,5 +331,20 @@ fn main() {
         let timeout = wait.map_or(-1, |w| w.as_micros().div_ceil(1000).min(c_int::MAX as u128) as c_int);
         let mut pfd = PollFd { fd, events: POLLIN, revents: 0 };
         unsafe { poll(&mut pfd, 1 as c_ulong, timeout) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modes() {
+        assert_eq!(parse_mode("once"), Some(Repeat::Once));
+        assert_eq!(parse_mode("repeat"), Some(Repeat::ServerDelay));
+        assert_eq!(parse_mode("repeat=300"), Some(Repeat::After(Duration::from_millis(300))));
+        for bad in ["repeat=", "repeat=0", "repeat=x", "repeat=20000", "repeat=-5", "Repeat", "repeat =300"] {
+            assert_eq!(parse_mode(bad), None, "{bad}");
+        }
     }
 }

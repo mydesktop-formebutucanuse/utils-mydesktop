@@ -15,7 +15,9 @@ receives the key as usual.
 
 - Keys marked `repeat` repeat at the X server's repeat delay and rate
   (`xset r rate`) while they are held down. Raw events carry no autorepeat,
-  so mediakeyd does it itself.
+  so mediakeyd does it itself. `repeat=MS` waits MS milliseconds instead of
+  the server's delay before the first repeat, for keys whose command should
+  run on smoothly when held.
 - A key's command never runs twice at the same time. Presses that arrive
   while it runs are merged into one more run, so slow commands such as
   backlight changes do not pile up.
@@ -48,7 +50,7 @@ install -D -m 644 mediakeyd/config.example ~/.config/mediakeyd/config
 file given with `-c`. One binding per line:
 
 ```
-KEYSYM  repeat|once  COMMAND
+KEYSYM  repeat|repeat=MS|once  COMMAND
 ```
 
 `COMMAND` runs with `/bin/sh -c`. Lines starting with `#` are comments.
