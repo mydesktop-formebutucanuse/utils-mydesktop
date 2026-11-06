@@ -6,8 +6,8 @@ sensor, and steps aside when you change either one yourself.
 
 It follows the design of
 [asahi-brightnessd](https://github.com/craig-miller/asahi-brightnessd) (same
-curves, same AC boost, same override rule) but costs less while idle and
-writes much less often:
+curves, AC boost, transition and override rule) but costs less while idle,
+writes less often, and runs transitions faster:
 
 | | asahi-brightnessd | autobrightd |
 |---|---|---|
@@ -17,13 +17,15 @@ writes much less often:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| Writes for a full 25 % → 100 % change | 73, about 5.6 s | 20, about 1 s |
+| A full 25 % → 100 % change | 73 writes, about 5.7 s (13 a second) | the same 73 writes, about 3.3 s (22 a second) |
 | Runs as | root | your user (udev rule below) |
 
 Writes matter: every screen write makes the Apple DCP driver sleep 42 ms
 and run a display commit, and the kernel sends a uevent for it. Measured
 on an M1 Pro, one write takes 43 to 47 ms, so a 33 ms tick plus a write is
-about 77 ms, not 33.
+about 77 ms, not 33. The driver holds a lock while it sleeps, so writes
+cannot overlap: 22 a second is the limit, and autobrightd runs frames back
+to back at that rate.
 
 ## How it works
 
@@ -36,9 +38,10 @@ about 77 ms, not 33.
   50 lux up.
 - **Dead band.** A new target is acted on only if it is at least 2 % of
   `max_brightness` away from the current one, or if it is 0.
-- **Ramps.** A change takes 1 s with at most 20 writes, evenly spaced in
-  time and in `ln(brightness)`, eased in and out. Frames missed because a
-  write was slow are skipped, so a change still ends on time.
+- **Transitions.** As in asahi-brightnessd, each frame moves 1/16 of the
+  remaining gap, at least one unit, so a change starts fast and slows down.
+  Frames are 45 ms apart (about 22 a second), as fast as the DCP driver
+  takes writes. A new target during a change just redirects it.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is
@@ -98,7 +101,7 @@ fi
 ## Tuning
 
 There is no configuration file. Curves, floors, the AC boost, smoothing,
-dead band, ramp length and the override thresholds are constants at the top
+dead band, frame time, transition step and the override thresholds are constants at the top
 of [src/logic.rs](src/logic.rs); device paths and timings are at the top of
 [src/main.rs](src/main.rs). Edit and rebuild.
 
@@ -106,7 +109,7 @@ of [src/logic.rs](src/logic.rs); device paths and timings are at the top of
 
 GPL-3.0-or-later, like the rest of the repository. See [LICENSE](../LICENSE).
 
-The curve points and the override rule come from asahi-brightnessd, which
-adapted them from juicecultus/asahi-auto-brightness. Both are MIT licensed,
-and the MIT license asks that their copyright notice stay with copies of
-that work; it is in [NOTICE](NOTICE).
+The curve points, the transition step and the override rule come from
+asahi-brightnessd, which adapted them from juicecultus/asahi-auto-brightness.
+Both are MIT licensed, and the MIT license asks that their copyright notice
+stay with copies of that work; it is in [NOTICE](NOTICE).

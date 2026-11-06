@@ -2,9 +2,9 @@
 //! Brightness logic without any I/O: curves, lux smoothing, the dead band,
 //! ramps and the manual-override rule.
 //!
-//! The curve points and the override rule come from asahi-brightnessd
-//! (Craig Hughes) and juicecultus/asahi-auto-brightness. Their MIT notice,
-//! which has to stay with copies of that work, is in NOTICE.
+//! The curve points, the transition step and the override rule come from
+//! asahi-brightnessd (Craig Hughes) and juicecultus/asahi-auto-brightness.
+//! Their MIT notice, which has to stay with copies of that work, is in NOTICE.
 
 use std::time::{Duration, Instant};
 
@@ -41,14 +41,13 @@ pub const LUX_ALPHA: f32 = 0.28;
 /// max_brightness) from the current one, so lux noise causes no writes.
 pub const DEADBAND_PCT: u32 = 2;
 
-/// Every change takes this long, whatever its size.
-pub const RAMP: Duration = Duration::from_millis(1000);
-/// At most this many writes per change. Each screen write makes the Apple
-/// DCP driver sleep 42 ms and run a display commit, so 20 per second is
-/// about as fast as it can go anyway.
-pub const RAMP_MAX_STEPS: u32 = 20;
-/// Smallest step worth a write: 1 % brightness ratio.
-const RAMP_LOG_STEP: f32 = 0.01;
+/// Time between frames while a change runs: about 22 a second. Each screen
+/// write makes the Apple DCP driver sleep 42 ms and run a display commit
+/// (43 to 47 ms measured), under a lock, so this is as fast as it goes.
+pub const FRAME: Duration = Duration::from_millis(45);
+/// Each frame moves 1/2^SMOOTH_SHIFT of the remaining gap, and at least one
+/// unit: asahi-brightnessd's transition, fast at first and slowing down.
+pub const SMOOTH_SHIFT: u32 = 4;
 
 /// Automatic control comes back after a manual change once the light has
 /// moved this much (percent of the lux at the time of the change) ...
@@ -122,49 +121,37 @@ impl LuxFilter {
     }
 }
 
-/// One brightness change spread over RAMP. Frames are evenly spaced in time;
-/// values are evenly spaced in ln(1 + units), eased in and out.
+/// One frame of a transition: 1/16 of the gap (rounded toward minus
+/// infinity, as an arithmetic shift does in the C original), at least 1.
+pub fn step_toward(current: u32, target: u32) -> u32 {
+    let delta = target as i64 - current as i64;
+    let step = match delta >> SMOOTH_SHIFT {
+        0 if delta > 0 => 1,
+        s if delta < 0 && s > -1 => -1,
+        s => s,
+    };
+    (current as i64 + step) as u32
+}
+
+/// A running change: where it goes and when its next frame is due.
 pub struct Ramp {
-    from: f32,
-    to: u32,
-    start: Instant,
-    steps: u32,
-    done: u32,
+    pub to: u32,
+    next_at: Instant,
 }
 
 impl Ramp {
-    pub fn new(from: u32, to: u32, start: Instant) -> Ramp {
-        let span = ((to as f32).ln_1p() - (from as f32).ln_1p()).abs();
-        let steps = ((span / RAMP_LOG_STEP).ceil() as u32).clamp(1, RAMP_MAX_STEPS);
-        Ramp { from: (from as f32).ln_1p(), to, start, steps, done: 0 }
+    pub fn new(to: u32, now: Instant) -> Ramp {
+        Ramp { to, next_at: now }
     }
 
-    pub fn steps(&self) -> u32 {
-        self.steps
-    }
-
-    pub fn finished(&self) -> bool {
-        self.done >= self.steps
-    }
-
-    /// When the next frame is due.
     pub fn next_at(&self) -> Instant {
-        self.start + RAMP * (self.done + 1) / self.steps
+        self.next_at
     }
 
-    /// Value for the frame due at `now`. Frames missed because a write was
-    /// slow are skipped, so the change still takes about RAMP.
-    pub fn advance(&mut self, now: Instant) -> u32 {
-        let elapsed = now.saturating_duration_since(self.start).as_secs_f32();
-        let due = (elapsed / RAMP.as_secs_f32() * self.steps as f32) as u32;
-        self.done = due.max(self.done + 1).min(self.steps);
-        if self.finished() {
-            return self.to;
-        }
-        let p = self.done as f32 / self.steps as f32;
-        let eased = p * p * (3.0 - 2.0 * p);
-        let to = (self.to as f32).ln_1p();
-        (self.from + (to - self.from) * eased).exp_m1().round() as u32
+    /// The value for the frame starting at `now`, from what the file holds.
+    pub fn advance(&mut self, current: u32, now: Instant) -> u32 {
+        self.next_at = now + FRAME;
+        step_toward(current, self.to)
     }
 }
 
@@ -222,7 +209,11 @@ impl Channel {
         let want = desired(&self.settings, lux, boost_pct);
         if worth_moving(self.target, want, self.settings.max) {
             self.target = want;
-            self.ramp = Some(Ramp::new(self.known, want, now));
+            // A running change just turns toward the new value.
+            match &mut self.ramp {
+                Some(ramp) => ramp.to = want,
+                None => self.ramp = Some(Ramp::new(want, now)),
+            }
             result = Update::Moving(want);
         }
         result
@@ -240,16 +231,22 @@ impl Channel {
         if now < ramp.next_at() {
             return None;
         }
-        let value = ramp.advance(now);
-        if ramp.finished() {
+        let value = ramp.advance(self.known, now);
+        if value == ramp.to {
             self.ramp = None;
         }
         (value != self.known).then_some(value)
     }
 
-    /// Records a successful write (the value read back after it).
+    /// Records a successful write (the value read back after it). If the
+    /// driver kept the old value, the change is given up rather than retried
+    /// forever.
     pub fn wrote(&mut self, value: u32) {
+        let stuck = value == self.known;
         self.known = value;
+        if stuck {
+            self.stop();
+        }
     }
 
     /// Ends any ramp where it is, so the next update starts from here.
@@ -327,37 +324,60 @@ mod tests {
     }
 
     #[test]
-    fn full_swing_takes_at_most_twenty_writes() {
+    fn steps_are_a_sixteenth_of_the_gap() {
+        assert_eq!(step_toward(125, 500), 148);
+        assert_eq!(step_toward(500, 125), 476);
+        assert_eq!(step_toward(140, 155), 141);
+        assert_eq!(step_toward(155, 140), 154);
+        assert_eq!(step_toward(140, 140), 140);
+    }
+
+    #[test]
+    fn full_swing_follows_the_original_curve() {
         let t = Instant::now();
         let mut ch = screen(125);
         assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(500));
         let w = run_ramp(&mut ch, t);
-        assert!(w.len() <= RAMP_MAX_STEPS as usize, "{}", w.len());
+        // The same 73 writes as asahi-brightnessd, 45 ms apart: about 3.3 s.
+        assert_eq!(w.len(), 73);
         assert!(w.windows(2).all(|p| p[0] < p[1]), "{w:?}");
         assert_eq!(*w.last().unwrap(), 500);
         assert_eq!(ch.known, 500);
+        assert!(ch.ramp.is_none());
     }
 
     #[test]
-    fn small_change_takes_few_writes() {
+    fn frames_are_45_ms_apart() {
         let t = Instant::now();
-        let mut ch = screen(140);
-        ch.target = 140;
-        ch.ramp = Some(Ramp::new(140, 155, t));
-        let w = run_ramp(&mut ch, t);
-        assert!(w.len() <= 11, "{w:?}");
-        assert_eq!(*w.last().unwrap(), 155);
+        let mut ch = screen(300);
+        ch.ramp = Some(Ramp::new(150, t));
+        assert_eq!(ch.frame(t), Some(290));
+        ch.wrote(290);
+        assert_eq!(ch.frame(t + FRAME / 2), None);
+        assert_eq!(ch.next_frame(), Some(t + FRAME));
+        assert_eq!(ch.frame(t + FRAME), Some(281));
     }
 
     #[test]
-    fn late_frames_are_skipped() {
+    fn new_target_turns_a_running_change() {
         let t = Instant::now();
-        let mut r = Ramp::new(125, 500, t);
-        assert_eq!(r.steps(), RAMP_MAX_STEPS);
-        r.advance(t + RAMP / 2);
-        assert!(!r.finished());
-        assert_eq!(r.advance(t + RAMP * 2), 500);
-        assert!(r.finished());
+        let mut ch = screen(125);
+        ch.update(1000.0, 0.0, t);
+        let at = ch.next_frame().unwrap();
+        ch.update(300.0, 0.0, t);
+        assert_eq!(ch.ramp.as_ref().map(|r| r.to), Some(350));
+        assert_eq!(ch.next_frame(), Some(at));
+    }
+
+    #[test]
+    fn a_value_the_driver_refuses_ends_the_change() {
+        let t = Instant::now();
+        let mut ch = screen(200);
+        ch.update(1000.0, 0.0, t);
+        assert!(ch.frame(t).is_some());
+        ch.wrote(200);
+        assert!(ch.ramp.is_none());
+        assert_eq!(ch.target, 200);
     }
 
     #[test]
