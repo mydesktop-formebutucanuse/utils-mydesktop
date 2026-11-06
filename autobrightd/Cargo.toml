@@ -4,9 +4,7 @@ version = "0.1.0"
 description = "Ambient-light auto-brightness for Apple Silicon Macs on Asahi Linux"
 readme = "README.md"
 edition.workspace = true
-# GPL-3.0-or-later, with curve points and the override rule from
-# asahi-brightnessd under MIT (LICENSE-MIT).
-license = "GPL-3.0-or-later AND MIT"
+license.workspace = true
 repository.workspace = true
 
 # No dependencies: sysfs through std, poll() declared in src/sys.rs.

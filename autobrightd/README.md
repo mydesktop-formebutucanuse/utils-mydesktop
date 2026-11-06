@@ -95,6 +95,9 @@ of [src/logic.rs](src/logic.rs); device paths and timings are at the top of
 
 ## License
 
-GPL-3.0-or-later. The curve points and the override rule come from
-asahi-brightnessd, which adapted them from juicecultus/asahi-auto-brightness;
-both are MIT licensed, see [LICENSE-MIT](LICENSE-MIT).
+GPL-3.0-or-later, like the rest of the repository. See [LICENSE](../LICENSE).
+
+The curve points and the override rule come from asahi-brightnessd, which
+adapted them from juicecultus/asahi-auto-brightness. Both are MIT licensed,
+and the MIT license asks that their copyright notice stay with copies of
+that work; it is in [NOTICE](NOTICE).

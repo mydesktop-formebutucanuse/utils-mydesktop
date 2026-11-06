@@ -1,6 +1,9 @@
+autobrightd is licensed under the GNU General Public License, version 3
+or later; see ../LICENSE.
+
 The curve points and the manual-override rule in src/logic.rs come from
-asahi-brightnessd (https://github.com/craig-miller/asahi-brightnessd),
-which is distributed under this license:
+asahi-brightnessd (https://github.com/craig-miller/asahi-brightnessd).
+Its license asks that the following notice be kept with copies of it:
 
 MIT License
 

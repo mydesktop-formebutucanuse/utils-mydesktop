@@ -1,10 +1,10 @@
-// SPDX-License-Identifier: GPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Brightness logic without any I/O: curves, lux smoothing, the dead band,
 //! ramps and the manual-override rule.
 //!
 //! The curve points and the override rule come from asahi-brightnessd
-//! (Craig Hughes) and juicecultus/asahi-auto-brightness, both MIT licensed;
-//! see LICENSE-MIT.
+//! (Craig Hughes) and juicecultus/asahi-auto-brightness. Their MIT notice,
+//! which has to stay with copies of that work, is in NOTICE.
 
 use std::time::{Duration, Instant};
 
