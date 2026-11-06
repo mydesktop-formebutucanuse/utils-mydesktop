@@ -6,7 +6,7 @@ sensor, and steps aside when you change either one yourself.
 
 It follows the design of
 [asahi-brightnessd](https://github.com/craig-miller/asahi-brightnessd) (same
-curves, AC boost, transition and override rule) but costs less while idle,
+curves, AC boost, override rule and transition step) but costs less while idle,
 writes less often, and runs transitions faster:
 
 | | asahi-brightnessd | autobrightd |
@@ -17,7 +17,7 @@ writes less often, and runs transitions faster:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| A full 25 % → 100 % change | 73 writes, about 5.7 s (13 a second) | the same 73 writes, about 3.3 s (22 a second) |
+| A full 25 % → 100 % rise | 73 writes, about 5.7 s (13 a second), fastest in the dark | the same 73 steps in reverse order, about 3.5 s (21 a second), slowest in the dark |
 | Runs as | root | your user (udev rule below) |
 
 Writes matter: every screen write makes the Apple DCP driver sleep 42 ms
@@ -38,10 +38,14 @@ to back at that rate.
   50 lux up.
 - **Dead band.** A new target is acted on only if it is at least 2 % of
   `max_brightness` away from the current one, or if it is 0.
-- **Transitions.** As in asahi-brightnessd, each frame moves 1/16 of the
-  remaining gap, at least one unit, so a change starts fast and slows down.
-  Frames are 45 ms apart (about 22 a second), as fast as the DCP driver
-  takes writes. A new target during a change just redirects it.
+- **Transitions.** Falling is asahi-brightnessd's curve: each frame moves
+  1/16 of the remaining gap, at least one unit, so it starts fast at the
+  bright end and creeps into the dark. Rising is asahi-brightnessd's own
+  rise played backwards in time: the same steps, smallest first, so it
+  creeps out of the dark one unit at a time and speeds up toward the bright
+  end, where steps are harder to see. Either way the dark part moves
+  slowly. Frames are 45 ms apart (about 21 a second), as fast as the DCP
+  driver takes writes. A new target during a change redirects it.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is

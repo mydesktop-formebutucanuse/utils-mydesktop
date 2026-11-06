@@ -138,14 +138,38 @@ pub fn step_toward(current: u32, target: u32) -> u32 {
 }
 
 /// A running change: where it goes and when its next frame is due.
+///
+/// Falling follows asahi-brightnessd: 1/16 of the remaining gap per frame,
+/// fast at first and slow toward the dark. Rising is asahi-brightnessd's
+/// own rise played backwards in time: the same steps, smallest first, so it
+/// starts with one-unit steps in the dark and speeds up toward the bright
+/// end.
 pub struct Ramp {
     pub to: u32,
     next_at: Instant,
+    /// For a rise, the values still to come, the next one last.
+    rise: Vec<u32>,
 }
 
 impl Ramp {
-    pub fn new(to: u32, now: Instant) -> Ramp {
-        Ramp { to, next_at: now }
+    pub fn new(from: u32, to: u32, next_at: Instant) -> Ramp {
+        // The original rise from `from` to `to`, as step sizes, biggest first.
+        let mut steps = Vec::new();
+        let mut v = from;
+        while v < to {
+            let next = step_toward(v, to);
+            steps.push(next - v);
+            v = next;
+        }
+        // The same steps smallest first, stored so that pop() gives the next.
+        let mut rise = Vec::with_capacity(steps.len());
+        let mut v = from;
+        for step in steps.iter().rev() {
+            v += step;
+            rise.push(v);
+        }
+        rise.reverse();
+        Ramp { to, next_at, rise }
     }
 
     pub fn next_at(&self) -> Instant {
@@ -155,6 +179,11 @@ impl Ramp {
     /// The value for the frame starting at `now`, from what the file holds.
     pub fn advance(&mut self, current: u32, now: Instant) -> u32 {
         self.next_at = now + FRAME;
+        while let Some(v) = self.rise.pop() {
+            if v > current {
+                return v;
+            }
+        }
         step_toward(current, self.to)
     }
 }
@@ -213,11 +242,9 @@ impl Channel {
         let want = desired(&self.settings, lux, boost_pct);
         if worth_moving(self.target, want, self.settings.max) {
             self.target = want;
-            // A running change just turns toward the new value.
-            match &mut self.ramp {
-                Some(ramp) => ramp.to = want,
-                None => self.ramp = Some(Ramp::new(want, now)),
-            }
+            // A running change turns toward the new value without a pause.
+            let next_at = self.ramp.as_ref().map_or(now, Ramp::next_at);
+            self.ramp = Some(Ramp::new(self.known, want, next_at));
             result = Update::Moving(want);
         }
         result
@@ -340,15 +367,41 @@ mod tests {
     }
 
     #[test]
-    fn full_swing_follows_the_original_curve() {
+    fn a_fall_follows_the_original_curve() {
+        let t = Instant::now();
+        let mut ch = screen(500);
+        assert_eq!(ch.update(0.0, 0.0, t), Update::Moving(125));
+        let w = run_ramp(&mut ch, t);
+        // Fast from the bright end, one unit at a time into the dark.
+        assert_eq!(&w[..3], &[476, 454, 433]);
+        assert_eq!(&w[w.len() - 3..], &[127, 126, 125]);
+        assert!(w.windows(2).all(|p| p[0] > p[1]), "{w:?}");
+        assert!(ch.ramp.is_none());
+    }
+
+    #[test]
+    fn a_rise_is_the_original_rise_played_backwards() {
+        // asahi-brightnessd's rise from 125 to 500, as step sizes.
+        let mut original = Vec::new();
+        let mut v = 125;
+        while v < 500 {
+            let next = step_toward(v, 500);
+            original.push(next - v);
+            v = next;
+        }
+        assert_eq!((original.len(), original[0]), (73, 23));
+
         let t = Instant::now();
         let mut ch = screen(125);
         assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(500));
-        let w = run_ramp(&mut ch, t);
-        // The same 73 writes as asahi-brightnessd, 45 ms apart: about 3.3 s.
-        assert_eq!(w.len(), 73);
-        assert!(w.windows(2).all(|p| p[0] < p[1]), "{w:?}");
-        assert_eq!(*w.last().unwrap(), 500);
+        let up = run_ramp(&mut ch, t);
+        let values: Vec<u32> = std::iter::once(125).chain(up.iter().copied()).collect();
+        let mut steps: Vec<u32> = values.windows(2).map(|p| p[1] - p[0]).collect();
+        steps.reverse();
+        // The same 73 steps in the opposite order: 1, 1, 1 ... 20, 22, 23.
+        assert_eq!(steps, original);
+        assert_eq!(&up[..3], &[126, 127, 128]);
+        assert_eq!(&up[up.len() - 3..], &[455, 477, 500]);
         assert_eq!(ch.known, 500);
         assert!(ch.ramp.is_none());
     }
@@ -357,7 +410,7 @@ mod tests {
     fn frames_are_45_ms_apart() {
         let t = Instant::now();
         let mut ch = screen(300);
-        ch.ramp = Some(Ramp::new(150, t));
+        ch.ramp = Some(Ramp::new(300, 150, t));
         assert_eq!(ch.frame(t), Some(290));
         ch.wrote(290);
         assert_eq!(ch.frame(t + FRAME / 2), None);
@@ -374,17 +427,19 @@ mod tests {
         ch.update(300.0, 0.0, t);
         assert_eq!(ch.ramp.as_ref().map(|r| r.to), Some(350));
         assert_eq!(ch.next_frame(), Some(at));
+        assert_eq!(ch.frame(at), Some(126));
     }
 
     #[test]
     fn a_write_landing_after_ours_is_a_manual_change() {
-        // Seen on the M1 Pro: we write 225, a key press that waited for the
-        // lock writes 200, and our read-back finds 200.
+        // Seen on the M1 Pro: we write 225 (221 now that rises start slow),
+        // a key press that waited for the lock writes 200, and our read-back
+        // finds 200.
         let t = Instant::now();
         let mut ch = screen(220);
-        ch.ramp = Some(Ramp::new(304, t));
-        assert_eq!(ch.frame(t), Some(225));
-        ch.wrote(225);
+        ch.ramp = Some(Ramp::new(220, 304, t));
+        assert_eq!(ch.frame(t), Some(221));
+        ch.wrote(221);
         assert!(ch.observe(200, 9.0));
         assert!(ch.ramp.is_none());
         assert_eq!((ch.known, ch.target), (200, 200));
@@ -395,7 +450,7 @@ mod tests {
     fn the_gap_after_a_write_delays_the_next_frame() {
         let t = Instant::now();
         let mut ch = screen(300);
-        ch.ramp = Some(Ramp::new(150, t));
+        ch.ramp = Some(Ramp::new(300, 150, t));
         ch.frame(t);
         let late = t + FRAME + WRITE_GAP;
         ch.not_before(late);
