@@ -105,6 +105,9 @@ takes about 60 a second.
 
 ## Install
 
+On Gentoo the package installs it with the udev rule (see the
+[top README](../README.md)). By hand:
+
 ```sh
 cargo build --release
 install -m 755 target/release/autobrightd ~/.local/bin/
@@ -123,8 +126,8 @@ autobrightd -v
 Start it with the session, e.g. from `~/GNUstep/Library/WindowMaker/autostart`:
 
 ```sh
-if [ -x "$HOME/.local/bin/autobrightd" ] && ! pgrep -x -u "$(id -u)" autobrightd >/dev/null; then
-	"$HOME/.local/bin/autobrightd" &
+if command -v autobrightd >/dev/null && ! pgrep -x -u "$(id -u)" autobrightd >/dev/null; then
+	autobrightd &
 fi
 ```
 

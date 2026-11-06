@@ -11,7 +11,35 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 | [scd](scd) | Gives Window Maker's GUI scale factor to GTK, Chromium, Electron and Qt applications and to the cursors, without scaling any of them twice |
 | [kernel](kernel) | Asahi kernel patches: the panel backlight in 1/64 nit and up to 60 updates a second, so brightness changes have no visible steps |
 
-## Build
+## Install on Gentoo
+
+[gentoo](gentoo) has a live ebuild, `x11-misc/utils-mydesktop-9999`, that
+builds the latest commit here and installs all the tools: `mediakeyd`,
+`autobrightd`, `scd` and `backlight` in `/usr/bin`, autobrightd's udev rule
+in `/usr/lib/udev/rules.d`, and the READMEs. The kernel patches are separate
+(see [kernel](kernel)).
+
+```sh
+sudo sh gentoo/install.sh          # adds it to the mydesktop overlay and emerges it
+sudo emerge --oneshot x11-misc/utils-mydesktop   # later, for the latest code
+```
+
+`gentoo/install.sh [OVERLAY]` copies the ebuild into the overlay (default
+`mydesktop`), adds `x11-misc/utils-mydesktop **` to
+`/etc/portage/package.accept_keywords/OVERLAY`, emerges the package and
+removes the copy of the udev rule a hand install left in
+`/etc/udev/rules.d`. Run it again when the ebuild changes.
+
+Then start the daemons with the X session, scd first (see each README), for
+example in `~/.xinitrc` before `exec wmaker`:
+
+```sh
+scd &
+mediakeyd &
+autobrightd &
+```
+
+## Build by hand
 
 The Rust tools are members of one Cargo workspace. From the top of the
 repository:

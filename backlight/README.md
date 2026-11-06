@@ -1,9 +1,10 @@
 # backlight
 
-The brightness keys' command. [mediakeyd](../mediakeyd) runs it.
+The brightness keys' command. [mediakeyd](../mediakeyd) runs it. On
+Gentoo the package installs it (see the [top README](../README.md)); by hand,
+`install -m 755 backlight/backlight ~/.local/bin/`.
 
 ```sh
-install -m 755 backlight/backlight ~/.local/bin/
 backlight screen +5     # one step brighter
 backlight screen -5     # one step dimmer
 backlight kbd +10       # keyboard backlight, +10 % of its maximum

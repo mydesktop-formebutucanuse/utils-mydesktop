@@ -29,7 +29,8 @@ No crate dependencies: only libX11 is linked.
 
 ## Build and install
 
-Needs Rust 1.85 or later and libX11. From the top of the repository:
+On Gentoo the package installs it (see the [top README](../README.md)).
+By hand, with Rust 1.85 or later and libX11, from the top of the repository:
 
 ```sh
 cargo build --release
@@ -50,12 +51,13 @@ While scd runs, `scd FACTOR` changes its factor: GTK, Chromium and Electron
 applications are rescaled at once, applications started afterwards get the
 new resources. Window Maker itself only reads `GSScaleFactor` when it starts.
 
-Start it with the X session, before the other applications, for example from
-Window Maker's `~/GNUstep/Library/WindowMaker/autostart`:
+Start it with the X session, before the other applications, for example in
+`~/.xinitrc` before `exec wmaker`, or from Window Maker's
+`~/GNUstep/Library/WindowMaker/autostart`:
 
 ```sh
-if [ -x "$HOME/.local/bin/scd" ] && ! pgrep -x -u "$(id -u)" scd >/dev/null; then
-	"$HOME/.local/bin/scd" &
+if command -v scd >/dev/null && ! pgrep -x -u "$(id -u)" scd >/dev/null; then
+	scd &
 fi
 ```
 

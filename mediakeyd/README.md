@@ -27,9 +27,18 @@ receives the key as usual.
 Needs Rust 1.85 or later, libX11, libXi and an X server with XInput 2.1 or
 later. From the top of the repository:
 
+On Gentoo the package installs it (see the [top README](../README.md)).
+By hand:
+
 ```sh
 cargo build --release
 install -m 755 target/release/mediakeyd ~/.local/bin/
+```
+
+Then the configuration (from `/usr/share/doc/utils-mydesktop-9999/mediakeyd/`
+with the package):
+
+```sh
 install -D -m 644 mediakeyd/config.example ~/.config/mediakeyd/config
 ```
 
@@ -60,8 +69,8 @@ Start it with the X session, for example from Window Maker's
 `~/GNUstep/Library/WindowMaker/autostart`:
 
 ```sh
-if [ -x "$HOME/.local/bin/mediakeyd" ] && ! pgrep -x -u "$(id -u)" mediakeyd >/dev/null; then
-	"$HOME/.local/bin/mediakeyd" &
+if command -v mediakeyd >/dev/null && ! pgrep -x -u "$(id -u)" mediakeyd >/dev/null; then
+	mediakeyd &
 fi
 ```
 

@@ -14,11 +14,12 @@ XF86AudioMute          once    wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 
 # Screen brightness (16 even steps, through autobrightd) and keyboard
 # backlight (elogind, no root).
-# backlight is backlight/backlight of utils-mydesktop, installed to ~/.local/bin.
-XF86MonBrightnessUp    repeat  $HOME/.local/bin/backlight screen +5
-XF86MonBrightnessDown  repeat  $HOME/.local/bin/backlight screen -5
-XF86KbdBrightnessUp    repeat  $HOME/.local/bin/backlight kbd +10
-XF86KbdBrightnessDown  repeat  $HOME/.local/bin/backlight kbd -10
+# backlight is backlight/backlight of utils-mydesktop (in /usr/bin with the
+# Gentoo package).
+XF86MonBrightnessUp    repeat  backlight screen +5
+XF86MonBrightnessDown  repeat  backlight screen -5
+XF86KbdBrightnessUp    repeat  backlight kbd +10
+XF86KbdBrightnessDown  repeat  backlight kbd -10
 
 # Media players (MPRIS)
 XF86AudioPlay          once    playerctl play-pause
