@@ -17,15 +17,14 @@ writes less often, and runs transitions faster:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| A full 25 % → 100 % change | 73 writes, about 5.7 s (13 a second); steps up to 17 %, biggest in the dark when rising | 89 frames, about 4 s (21 a second); every step about 1.5 % |
+| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | always 6 s on an S-curve; 140 → 302 took 104 writes of 1 or 2 units, at most 1.2 % |
 | Runs as | root | your user (udev rule below) |
 
 Writes matter: every screen write makes the Apple DCP driver sleep 42 ms
 and run a display commit, and the kernel sends a uevent for it. Measured
 on an M1 Pro, one write takes 43 to 47 ms, so a 33 ms tick plus a write is
 about 77 ms, not 33. The driver holds a lock while it sleeps, so writes
-cannot overlap: 22 a second is the limit, and autobrightd runs frames back
-to back at that rate.
+cannot overlap: about 21 a second is the limit.
 
 ## How it works
 
@@ -38,13 +37,16 @@ to back at that rate.
   50 lux up.
 - **Dead band.** A new target is acted on only if it is at least 2 % of
   `max_brightness` away from the current one, or if it is 0.
-- **Transitions.** Frames are evenly spaced in `ln(1 + brightness)`: each
-  one changes the brightness by the same ratio, 1.5 %, so a change looks
-  even from the dark to full brightness, up or down. A change takes at most
-  89 frames (about 4 s); longer ones, such as the keyboard coming on from 0,
-  take bigger steps instead. Frames are 45 ms apart (about 21 a second), as
-  fast as the DCP driver takes writes. A new target during a change starts
-  a new one from where it is, without a pause.
+- **Transitions.** Every change takes 6 s along a cubic S-curve in
+  `ln(1 + brightness)` (eyes respond to ratios, so it looks even from the
+  dark to full brightness): it starts and ends gently. A change redirected
+  midway keeps its position and speed, so it does not jerk, and never
+  overshoots the new target. The file only takes whole units (nits for the
+  screen), so writes do not follow a fixed beat: each new whole value is
+  written at the moment the curve reaches it. In the dark that means one
+  unit at a time at an even pace; where the curve moves faster than about
+  21 writes a second, each write catches up to where the curve is.
+  Keyboard writes, which are instant, are at least 20 ms apart.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is
@@ -107,10 +109,9 @@ fi
 ## Tuning
 
 There is no configuration file. Curves, floors, the AC boost, smoothing,
-dead band, frame time, transition step and length, and the override
-thresholds are constants at the top of [src/logic.rs](src/logic.rs); device
-paths and timings are at the top of [src/main.rs](src/main.rs). Edit and
-rebuild.
+dead band, transition length and the override thresholds are constants at
+the top of [src/logic.rs](src/logic.rs); device paths and timings are at the
+top of [src/main.rs](src/main.rs). Edit and rebuild.
 
 ## License
 
