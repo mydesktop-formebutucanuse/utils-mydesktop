@@ -17,7 +17,7 @@ writes less often, and runs transitions faster:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | always 6 s on an S-curve; 140 → 302 took 104 writes of 1 or 2 units, at most 1.2 % |
+| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | always 6 s on an S-curve, about 22 writes a second; with the [kernel patch](../kernel), 140 → 301 nits in steps of 0.04 to 0.9 % (simulated) |
 | Runs as | root | your user (udev rule below) |
 
 Writes matter: every screen write makes the Apple DCP driver sleep 42 ms
@@ -41,13 +41,11 @@ cannot overlap: about 21 a second is the limit.
   `ln(1 + brightness)` (eyes respond to ratios, so it looks even from the
   dark to full brightness): it starts and ends gently. A change redirected
   midway keeps its position and speed, so it does not jerk, and never
-  overshoots the new target. The file only takes whole units (nits for the
-  screen, or 1/16 nit with the [kernel patch](../kernel)), so writes do not
-  follow a fixed beat: each new whole value is written at the moment the
-  curve reaches it. In the dark that means one unit at a time at an even
-  pace; where the curve moves faster than about 21 writes a second, each
-  write catches up to where the curve is.
-  Keyboard writes, which are instant, are at least 20 ms apart.
+  overshoots the new target. The curve is written on a fixed beat of about
+  22 writes a second, as fast as the DCP driver takes them, each write being
+  where the curve is at that moment. This is smooth with the
+  [kernel patch](../kernel), which makes the screen count in 1/16 nit; with
+  whole nits the slow parts of the curve move in visible 1-nit steps.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is

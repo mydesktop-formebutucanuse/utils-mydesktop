@@ -43,18 +43,14 @@ pub const DEADBAND_PCT: u32 = 2;
 
 /// Every change takes this long, whatever its size.
 pub const RAMP: Duration = Duration::from_secs(6);
-/// Writes are at least this far apart. A screen write takes longer anyway:
-/// the Apple DCP driver sleeps 42 ms and runs a display commit under the
-/// backlight lock (43 to 47 ms measured). This keeps keyboard writes, which
-/// are instant, from running at hundreds a second.
-pub const MIN_FRAME: Duration = Duration::from_millis(20);
+/// Time between writes while a change runs, about 22 a second. A screen
+/// write takes about this long anyway: the Apple DCP driver sleeps 42 ms and
+/// runs a display commit under the backlight lock (43 to 47 ms measured).
+pub const FRAME: Duration = Duration::from_millis(45);
 /// Pause after each write before the next frame looks at the file. A write
 /// by someone else that waited for the lock gets it in that time, so the
 /// next frame sees it instead of overwriting it.
 pub const WRITE_GAP: Duration = Duration::from_millis(1);
-/// How finely the curve is searched for the moment it reaches the next
-/// whole value.
-const SCAN: Duration = Duration::from_millis(2);
 
 /// Automatic control comes back after a manual change once the light has
 /// moved this much (percent of the lux at the time of the change) ...
@@ -133,11 +129,10 @@ impl LuxFilter {
 /// rest too, so it is an S-curve that starts and ends gently. A change
 /// redirected midway starts with the speed it had, so it does not jerk.
 ///
-/// The brightness file only takes whole units (nits for the screen), so the
-/// curve is not sampled on a fixed beat: each new whole value is written at
-/// the moment the curve reaches it. In the dark that is one unit at a time,
-/// evenly paced; where the curve moves faster than writes can follow, each
-/// write catches up to where the curve is.
+/// It is written on a fixed beat (FRAME), each write being where the curve
+/// is at that moment. That is smooth when the screen counts in 1/16 nit
+/// (the kernel patch in ../kernel); with whole nits, the slow parts of the
+/// curve show 1-nit steps.
 pub struct Ramp {
     pub to: u32,
     start: Instant,
@@ -198,19 +193,6 @@ impl Ramp {
         }
         self.position(t).exp_m1().round().max(0.0) as u32
     }
-
-    /// The first moment after `after` when the curve reaches a whole value
-    /// other than `current`, or the end of the change.
-    pub fn next_change(&self, current: u32, after: Instant) -> Instant {
-        let mut t = after;
-        while t < self.end() {
-            t += SCAN;
-            if self.value(t) != current {
-                return t.min(self.end());
-            }
-        }
-        self.end()
-    }
 }
 
 /// One backlight (screen or keyboard).
@@ -224,8 +206,6 @@ pub struct Channel {
     pub ramp: Option<Ramp>,
     /// Smoothed lux when the user took over; None while automatic.
     pub override_lux: Option<f32>,
-    /// No write before this (the previous one and the gap after it).
-    quiet_until: Instant,
 }
 
 /// What happened when a sample was applied to a channel.
@@ -240,15 +220,7 @@ pub enum Update {
 
 impl Channel {
     pub fn new(name: &'static str, settings: Settings, current: u32) -> Channel {
-        Channel {
-            name,
-            settings,
-            known: current,
-            target: current,
-            ramp: None,
-            override_lux: None,
-            quiet_until: Instant::now(),
-        }
+        Channel { name, settings, known: current, target: current, ramp: None, override_lux: None }
     }
 
     /// A value read back from the brightness file. Returns true when someone
@@ -278,12 +250,12 @@ impl Channel {
         if worth_moving(self.target, want, self.settings.max) {
             self.target = want;
             // Carry on from where a running change is, at its speed.
-            let (from, speed) = match &self.ramp {
-                Some(r) => (r.position(now), r.speed(now)),
-                None => ((self.known as f32).ln_1p(), 0.0),
+            let (from, speed, next_at) = match &self.ramp {
+                Some(r) => (r.position(now), r.speed(now), r.next_at),
+                None => ((self.known as f32).ln_1p(), 0.0, now),
             };
             let mut ramp = Ramp::new(from, speed, want, now);
-            ramp.next_at = ramp.next_change(self.known, now);
+            ramp.next_at = next_at;
             self.ramp = Some(ramp);
             result = Update::Moving(want);
         }
@@ -292,23 +264,22 @@ impl Channel {
 
     /// When the next write is due, if a change is running.
     pub fn next_frame(&self) -> Option<Instant> {
-        self.ramp.as_ref().map(|r| r.next_at.max(self.quiet_until))
+        self.ramp.as_ref().map(|r| r.next_at)
     }
 
-    /// The value to write now, if a write is due and the curve has reached a
-    /// value the file does not hold yet.
+    /// The value to write now, if a write is due and the curve has moved
+    /// away from what the file holds.
     pub fn frame(&mut self, now: Instant) -> Option<u32> {
-        if now < self.next_frame()? {
+        let ramp = self.ramp.as_mut()?;
+        if now < ramp.next_at {
             return None;
         }
-        let ramp = self.ramp.as_mut()?;
         let value = ramp.value(now);
         if now >= ramp.end() {
             self.ramp = None;
         } else {
-            ramp.next_at = ramp.next_change(value, now);
+            ramp.next_at = now + FRAME;
         }
-        self.quiet_until = now + MIN_FRAME;
         (value != self.known).then_some(value)
     }
 
@@ -321,7 +292,9 @@ impl Channel {
 
     /// Delays the next write until at least `t`.
     pub fn not_before(&mut self, t: Instant) {
-        self.quiet_until = self.quiet_until.max(t);
+        if let Some(ramp) = &mut self.ramp {
+            ramp.next_at = ramp.next_at.max(t);
+        }
     }
 
     /// Ends any change where it is, so the next update starts from here.
@@ -338,10 +311,15 @@ mod tests {
     /// A screen write as measured on the M1 Pro.
     const SCREEN_WRITE: Duration = Duration::from_millis(46);
 
+    /// Screen units with the kernel patch: 1/16 nit, 8000 at 500 nits.
+    fn nits(n: u32) -> u32 {
+        n * 16
+    }
+
     fn screen(current: u32) -> Channel {
         Channel::new(
             "screen",
-            Settings { curve: SCREEN_CURVE, floor_pct: SCREEN_FLOOR_PCT, max: 500 },
+            Settings { curve: SCREEN_CURVE, floor_pct: SCREEN_FLOOR_PCT, max: nits(500) },
             current,
         )
     }
@@ -371,10 +349,18 @@ mod tests {
     }
 
     fn start_change(ch: &mut Channel, to: u32, t: Instant) {
-        let mut ramp = Ramp::new((ch.known as f32).ln_1p(), 0.0, to, t);
-        ramp.next_at = ramp.next_change(ch.known, t);
         ch.target = to;
-        ch.ramp = Some(ramp);
+        ch.ramp = Some(Ramp::new((ch.known as f32).ln_1p(), 0.0, to, t));
+    }
+
+    /// Runs frames until one writes, and returns (when, value).
+    fn first_write(ch: &mut Channel) -> (Instant, u32) {
+        loop {
+            let at = ch.next_frame().unwrap();
+            if let Some(v) = ch.frame(at) {
+                return (at, v);
+            }
+        }
     }
 
     #[test]
@@ -419,39 +405,38 @@ mod tests {
     }
 
     #[test]
-    fn a_change_takes_six_seconds_and_starts_gently() {
+    fn a_change_takes_six_seconds_and_has_no_visible_step() {
         let t = Instant::now();
-        let mut ch = screen(140);
-        start_change(&mut ch, 301, t);
+        let mut ch = screen(nits(140));
+        start_change(&mut ch, nits(301), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
         let (last_t, last_v) = *w.last().unwrap();
-        assert_eq!(last_v, 301);
-        assert!(last_t > 5.0 && last_t <= 6.0, "{last_t}");
+        assert_eq!(last_v, nits(301));
+        assert!(last_t > 5.9 && last_t < 6.1, "{last_t}");
         assert!(w.windows(2).all(|p| p[0].1 < p[1].1));
-        // No write right away: the first unit is reached after about 0.2 s,
-        // and the first second goes one unit at a time.
-        assert!(w[0].0 > 0.15, "{w:?}");
-        let first_second: Vec<u32> = w.iter().take_while(|x| x.0 < 1.0).map(|x| x.1).collect();
-        assert!(first_second.windows(2).all(|p| p[1] - p[0] == 1), "{first_second:?}");
-        assert!(step_pcts(140, &w).iter().all(|&p| p < 1.6), "{w:?}");
+        let pcts = step_pcts(nits(140), &w);
+        // Under 1 % even at full speed; the start and end creep.
+        assert!(pcts.iter().all(|&p| p < 1.0), "{pcts:?}");
+        assert!(pcts[..5].iter().all(|&p| p < 0.2), "{pcts:?}");
+        assert!(pcts[pcts.len() - 5..].iter().all(|&p| p < 0.2), "{pcts:?}");
         assert!(ch.ramp.is_none());
     }
 
     #[test]
     fn a_full_swing_stays_under_two_percent_a_step() {
         let t = Instant::now();
-        let mut ch = screen(125);
-        assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(500));
+        let mut ch = screen(nits(125));
+        assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(nits(500)));
         let w = run(&mut ch, t, SCREEN_WRITE);
-        assert_eq!(w.last().unwrap().1, 500);
-        assert!(step_pcts(125, &w).iter().all(|&p| p < 2.0));
+        assert_eq!(w.last().unwrap().1, nits(500));
+        assert!(step_pcts(nits(125), &w).iter().all(|&p| p < 2.0));
         // Falls are the same curve the other way.
-        let mut ch = screen(500);
-        start_change(&mut ch, 125, t);
+        let mut ch = screen(nits(500));
+        start_change(&mut ch, nits(125), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
-        assert_eq!(w.last().unwrap().1, 125);
+        assert_eq!(w.last().unwrap().1, nits(125));
         assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
-        assert!(step_pcts(500, &w).iter().all(|&p| p < 2.0));
+        assert!(step_pcts(nits(500), &w).iter().all(|&p| p < 2.0));
     }
 
     #[test]
@@ -488,23 +473,25 @@ mod tests {
     #[test]
     fn a_new_target_redirects_a_running_change() {
         let t = Instant::now();
-        let mut ch = screen(125);
+        let mut ch = screen(nits(125));
         ch.update(1000.0, 0.0, t);
         let mid = t + Duration::from_secs(2);
         let v = ch.ramp.as_ref().unwrap().value(mid);
+        let due = ch.next_frame();
         ch.update(300.0, 0.0, mid);
         let r = ch.ramp.as_ref().unwrap();
-        assert_eq!(r.to, 350);
+        assert_eq!(r.to, nits(350));
         assert_eq!(r.value(mid), v);
+        // The beat goes on: no extra frame, no lost one.
+        assert_eq!(ch.next_frame(), due);
     }
 
     #[test]
     fn writes_wait_for_the_previous_one() {
         let t = Instant::now();
-        let mut ch = screen(300);
-        start_change(&mut ch, 150, t);
-        let at = ch.next_frame().unwrap();
-        let v = ch.frame(at).unwrap();
+        let mut ch = screen(nits(300));
+        start_change(&mut ch, nits(150), t);
+        let (at, v) = first_write(&mut ch);
         ch.wrote(v);
         let after = at + SCREEN_WRITE + WRITE_GAP;
         ch.not_before(after);
@@ -513,7 +500,8 @@ mod tests {
     }
 
     #[test]
-    fn the_keyboard_from_off_is_capped_at_fifty_writes_a_second() {
+    fn the_keyboard_keeps_the_same_beat() {
+        // LED writes are instant; they still come at most once a frame.
         let t = Instant::now();
         let mut kbd = Channel::new(
             "kbd",
@@ -523,7 +511,7 @@ mod tests {
         assert_eq!(kbd.update(0.0, 0.0, t), Update::Moving(191));
         let w = run(&mut kbd, t, Duration::ZERO);
         assert_eq!(w.last().unwrap().1, 191);
-        assert!(w.windows(2).all(|p| p[1].0 - p[0].0 >= 0.0199), "{w:?}");
+        assert!(w.windows(2).all(|p| p[1].0 - p[0].0 >= 0.0449), "{w:?}");
     }
 
     #[test]
@@ -531,29 +519,28 @@ mod tests {
         // Seen on the M1 Pro: we write 225, a key press that waited for the
         // lock writes 200, and our read-back finds 200.
         let t = Instant::now();
-        let mut ch = screen(220);
-        start_change(&mut ch, 304, t);
-        let at = ch.next_frame().unwrap();
-        let ours = ch.frame(at).unwrap();
+        let mut ch = screen(nits(220));
+        start_change(&mut ch, nits(304), t);
+        let (at, ours) = first_write(&mut ch);
         ch.wrote(ours);
-        assert!(ch.observe(200, 9.0));
+        assert!(ch.observe(nits(200), 9.0));
         assert!(ch.ramp.is_none());
-        assert_eq!((ch.known, ch.target), (200, 200));
+        assert_eq!((ch.known, ch.target), (nits(200), nits(200)));
         assert_eq!(ch.update(9.0, 30.0, at), Update::Nothing);
     }
 
     #[test]
     fn manual_change_holds_until_light_moves() {
         let t = Instant::now();
-        let mut ch = screen(300);
-        assert!(!ch.observe(300, 100.0));
-        assert!(ch.observe(200, 100.0));
+        let mut ch = screen(nits(300));
+        assert!(!ch.observe(nits(300), 100.0));
+        assert!(ch.observe(nits(200), 100.0));
         assert_eq!(ch.update(150.0, 0.0, t), Update::Nothing);
         assert!(ch.ramp.is_none());
-        // 100 → 180 lux is +80 %: automatic again, from 200.
-        assert_eq!(ch.update(180.0, 0.0, t), Update::Moving(280));
+        // 100 → 180 lux is +80 %: automatic again, from 200 nits to 280.
+        assert_eq!(ch.update(180.0, 0.0, t), Update::Moving(nits(280)));
         assert_eq!(ch.override_lux, None);
-        assert_eq!(run(&mut ch, t, SCREEN_WRITE).last().unwrap().1, 280);
+        assert_eq!(run(&mut ch, t, SCREEN_WRITE).last().unwrap().1, nits(280));
     }
 
     #[test]
