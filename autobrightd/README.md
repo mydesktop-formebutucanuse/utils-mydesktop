@@ -7,7 +7,7 @@ sensor, and steps aside when you change either one yourself.
 It follows the design of
 [asahi-brightnessd](https://github.com/craig-miller/asahi-brightnessd) (same
 curves, AC boost and override rule) but costs less while idle,
-writes less often, and runs transitions faster:
+writes less often, and changes brightness in steps too small to see:
 
 | | asahi-brightnessd | autobrightd |
 |---|---|---|
@@ -17,7 +17,7 @@ writes less often, and runs transitions faster:
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
 | Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
-| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | always 6 s on an S-curve, about 22 writes a second; with the [kernel patch](../kernel), 140 → 301 nits in steps of 0.04 to 0.9 % (simulated) |
+| A change | 25 % → 100 % in 73 writes over about 5.7 s; steps up to 17 %, biggest in the dark when rising | at most 0.3 % a write, easing in and out; with the [kernel patch](../kernel), 140 → 315 nits took 296 writes over 14 s, 0.27 % on average (measured) |
 | Runs as | root | your user (udev rule below) |
 
 Writes matter: every screen write makes the Apple DCP driver sleep 42 ms
@@ -37,15 +37,19 @@ cannot overlap: about 21 a second is the limit.
   50 lux up.
 - **Dead band.** A new target is acted on only if it is at least 2 % of
   `max_brightness` away from the current one, or if it is 0.
-- **Transitions.** Every change takes 6 s along a cubic S-curve in
-  `ln(1 + brightness)` (eyes respond to ratios, so it looks even from the
-  dark to full brightness): it starts and ends gently. A change redirected
-  midway keeps its position and speed, so it does not jerk, and never
-  overshoots the new target. The curve is written on a fixed beat of about
-  22 writes a second, as fast as the DCP driver takes them, each write being
-  where the curve is at that moment. This is smooth with the
-  [kernel patch](../kernel), which makes the screen count in 1/16 nit; with
-  whole nits the slow parts of the curve move in visible 1-nit steps.
+- **Transitions.** Around 20 Hz the eye picks up a brightness step of
+  roughly 1 % on a large bright field, and the DCP driver takes only about
+  21 writes a second, so the only way to make a change invisible is to make
+  each step small. A change moves in `ln(1 + brightness)` (ratios, which is
+  what the eye sees) at no more than 0.3 % per write, speeding up over the
+  first 1.5 s and slowing down over the last. Its length follows its size:
+  about 1.5 s for a small change, 14 s for 140 to 315 nits, 24 s for 25 % to
+  100 %. A new target during a change keeps the speed it has; one in the
+  other direction slows down first, and nothing overshoots. Each write is
+  the nearest whole value, which needs the [kernel patch](../kernel) (1/16
+  nit) to stay smooth; with whole nits the slow parts move in 1-nit steps.
+  The keyboard moves much faster (off to 75 % in about 6 s): nobody watches
+  it fade.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is
@@ -108,9 +112,10 @@ fi
 ## Tuning
 
 There is no configuration file. Curves, floors, the AC boost, smoothing,
-dead band, transition length and the override thresholds are constants at
-the top of [src/logic.rs](src/logic.rs); device paths and timings are at the
-top of [src/main.rs](src/main.rs). Edit and rebuild.
+dead band, transition speeds (`SCREEN_MOTION`, `KBD_MOTION`) and the
+override thresholds are constants at the top of [src/logic.rs](src/logic.rs);
+device paths and timings are at the top of [src/main.rs](src/main.rs). Edit
+and rebuild.
 
 ## License
 

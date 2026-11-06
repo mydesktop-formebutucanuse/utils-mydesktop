@@ -4,7 +4,7 @@
 //! ambient light sensor and steps aside when someone else changes them.
 //!
 //! It wakes 5 times a second while nothing changes (the sensor reports every
-//! 200 ms), and only while a change runs, when it reaches a new value. Manual
+//! 200 ms), and about 21 times a second while a change runs. Manual
 //! screen changes are noticed through sysfs_notify() on actual_brightness,
 //! and plugging or unplugging the charger through kernel uevents.
 
@@ -112,6 +112,7 @@ impl Daemon {
         let screen_settings = Settings {
             curve: logic::SCREEN_CURVE,
             floor_pct: logic::SCREEN_FLOOR_PCT,
+            motion: logic::SCREEN_MOTION,
             max: max_brightness(SCREEN_DIR)?,
         };
         let screen = open_backlight("screen", SCREEN_DIR, screen_settings, write)?;
@@ -123,7 +124,12 @@ impl Daemon {
 
         let kbd = match max_brightness(KBD_DIR) {
             Ok(max) => {
-                let settings = Settings { curve: logic::KBD_CURVE, floor_pct: logic::KBD_FLOOR_PCT, max };
+                let settings = Settings {
+                    curve: logic::KBD_CURVE,
+                    floor_pct: logic::KBD_FLOOR_PCT,
+                    max,
+                    motion: logic::KBD_MOTION,
+                };
                 Some(open_backlight("kbd", KBD_DIR, settings, write)?)
             }
             Err(_) => None,

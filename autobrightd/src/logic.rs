@@ -41,8 +41,26 @@ pub const LUX_ALPHA: f32 = 0.28;
 /// max_brightness) from the current one, so lux noise causes no writes.
 pub const DEADBAND_PCT: u32 = 2;
 
-/// Every change takes this long, whatever its size.
-pub const RAMP: Duration = Duration::from_secs(6);
+/// How fast a channel's brightness may change, in ln(1 + units): ratios,
+/// since that is what the eye sees.
+#[derive(Clone, Copy)]
+pub struct Motion {
+    /// Top speed, per second.
+    pub speed: f32,
+    /// How quickly it speeds up and slows down, per second squared.
+    pub accel: f32,
+}
+
+/// The screen moves at most 0.3 % per write. Writes come about every 48 ms
+/// (the DCP driver takes 43 to 47 ms each), and around 20 Hz the eye picks
+/// up a brightness step of roughly 1 % on a large bright field: 1 % steps
+/// did show. Top speed is reached, and given up, over 1.5 s. A small change
+/// takes about 1.5 s, 140 to 315 nits about 14 s, 25 % to 100 % about 24 s.
+pub const SCREEN_MOTION: Motion = Motion { speed: 0.003 / 0.048, accel: 0.003 / 0.048 / 1.5 };
+/// Nobody watches the keyboard fade, and from off every unit is a large
+/// ratio, so it moves much faster: off to 75 % in about 6 s.
+pub const KBD_MOTION: Motion = Motion { speed: 1.0, accel: 1.0 };
+
 /// Time between writes while a change runs, about 22 a second. A screen
 /// write takes about this long anyway: the Apple DCP driver sleeps 42 ms and
 /// runs a display commit under the backlight lock (43 to 47 ms measured).
@@ -76,6 +94,7 @@ pub struct Settings {
     pub curve: Curve,
     pub floor_pct: f32,
     pub max: u32,
+    pub motion: Motion,
 }
 
 /// The brightness the curve asks for, in device units.
@@ -124,74 +143,55 @@ impl LuxFilter {
     }
 }
 
-/// A change: a cubic curve in ln(1 + brightness) over RAMP, from where the
-/// brightness is to the target, arriving at rest. A fresh change starts at
-/// rest too, so it is an S-curve that starts and ends gently. A change
-/// redirected midway starts with the speed it had, so it does not jerk.
+/// A running change: where the brightness is and how fast it moves, in
+/// ln(1 + units), heading for `to` within the channel's Motion limits. It
+/// speeds up and slows down gently and never overshoots. A new target only
+/// changes where it heads: the speed carries on, and a change that has to
+/// turn around slows down first.
 ///
-/// It is written on a fixed beat (FRAME), each write being where the curve
-/// is at that moment. That is smooth when the screen counts in 1/16 nit
-/// (the kernel patch in ../kernel); with whole nits, the slow parts of the
-/// curve show 1-nit steps.
+/// The brightness file takes whole units, so each write is the nearest one
+/// to where the motion is. With the 1/16-nit kernel patch (../kernel) that
+/// is fine enough not to show; with whole nits, slow parts move in 1-nit
+/// steps.
 pub struct Ramp {
     pub to: u32,
-    start: Instant,
-    x0: f32,
-    /// Starting speed, in ln units per RAMP (a Hermite tangent).
-    m0: f32,
-    x1: f32,
+    pos: f32,
+    speed: f32,
+    last: Instant,
     next_at: Instant,
 }
 
 impl Ramp {
-    /// `from` is in ln(1 + units), `speed` in ln units per second.
-    pub fn new(from: f32, speed: f32, to: u32, start: Instant) -> Ramp {
-        let x1 = (to as f32).ln_1p();
-        let span = x1 - from;
-        // Keep the speed only if it goes the new way, and only up to three
-        // times the span: more would overshoot the target and come back.
-        let m0 = if speed * span > 0.0 {
-            let limit = 3.0 * span.abs();
-            (speed * RAMP.as_secs_f32()).clamp(-limit, limit)
-        } else {
-            0.0
-        };
-        Ramp { to, start, x0: from, m0, x1, next_at: start }
+    pub fn new(from: u32, to: u32, now: Instant) -> Ramp {
+        Ramp { to, pos: (from as f32).ln_1p(), speed: 0.0, last: now, next_at: now }
     }
 
-    fn progress(&self, t: Instant) -> f32 {
-        (t.saturating_duration_since(self.start).as_secs_f32() / RAMP.as_secs_f32()).min(1.0)
+    /// Current speed, in ln units per second.
+    #[cfg(test)]
+    pub fn speed(&self) -> f32 {
+        self.speed
     }
 
-    pub fn end(&self) -> Instant {
-        self.start + RAMP
-    }
-
-    /// Where the curve is at `t`, in ln(1 + units).
-    pub fn position(&self, t: Instant) -> f32 {
-        let s = self.progress(t);
-        let (s2, s3) = (s * s, s * s * s);
-        (2.0 * s3 - 3.0 * s2 + 1.0) * self.x0 + (s3 - 2.0 * s2 + s) * self.m0 + (3.0 * s2 - 2.0 * s3) * self.x1
-    }
-
-    /// How fast the curve moves at `t`, in ln units per second.
-    pub fn speed(&self, t: Instant) -> f32 {
-        let s = self.progress(t);
-        if s >= 1.0 {
-            return 0.0;
+    /// Moves on to `now`. Returns the whole value there, and whether the
+    /// target has been reached.
+    pub fn advance(&mut self, now: Instant, m: Motion) -> (u32, bool) {
+        // A long gap (a suspend, say) must not turn into one big step.
+        let dt = now.saturating_duration_since(self.last).as_secs_f32().min(0.25);
+        self.last = now;
+        let target = (self.to as f32).ln_1p();
+        let dist = target - self.pos;
+        let dir = dist.signum();
+        // As fast as allowed, but no faster than it can still stop in time.
+        let want = dir * m.speed.min((2.0 * m.accel * dist.abs()).sqrt());
+        self.speed += (want - self.speed).clamp(-m.accel * dt, m.accel * dt);
+        let pos = self.pos + self.speed * dt;
+        if dist == 0.0 || (target - pos) * dir <= 0.0 {
+            self.pos = target;
+            self.speed = 0.0;
+            return (self.to, true);
         }
-        let d = (6.0 * s * s - 6.0 * s) * self.x0
-            + (3.0 * s * s - 4.0 * s + 1.0) * self.m0
-            + (6.0 * s - 6.0 * s * s) * self.x1;
-        d / RAMP.as_secs_f32()
-    }
-
-    /// The whole value the curve stands at, at `t`.
-    pub fn value(&self, t: Instant) -> u32 {
-        if t >= self.end() {
-            return self.to;
-        }
-        self.position(t).exp_m1().round().max(0.0) as u32
+        self.pos = pos;
+        (pos.exp_m1().round().max(0.0) as u32, false)
     }
 }
 
@@ -249,14 +249,11 @@ impl Channel {
         let want = desired(&self.settings, lux, boost_pct);
         if worth_moving(self.target, want, self.settings.max) {
             self.target = want;
-            // Carry on from where a running change is, at its speed.
-            let (from, speed, next_at) = match &self.ramp {
-                Some(r) => (r.position(now), r.speed(now), r.next_at),
-                None => ((self.known as f32).ln_1p(), 0.0, now),
-            };
-            let mut ramp = Ramp::new(from, speed, want, now);
-            ramp.next_at = next_at;
-            self.ramp = Some(ramp);
+            match &mut self.ramp {
+                // Only where it heads changes; position, speed and beat stay.
+                Some(ramp) => ramp.to = want,
+                None => self.ramp = Some(Ramp::new(self.known, want, now)),
+            }
             result = Update::Moving(want);
         }
         result
@@ -267,15 +264,16 @@ impl Channel {
         self.ramp.as_ref().map(|r| r.next_at)
     }
 
-    /// The value to write now, if a write is due and the curve has moved
+    /// The value to write now, if a write is due and the change has moved
     /// away from what the file holds.
     pub fn frame(&mut self, now: Instant) -> Option<u32> {
+        let motion = self.settings.motion;
         let ramp = self.ramp.as_mut()?;
         if now < ramp.next_at {
             return None;
         }
-        let value = ramp.value(now);
-        if now >= ramp.end() {
+        let (value, arrived) = ramp.advance(now, motion);
+        if arrived {
             self.ramp = None;
         } else {
             ramp.next_at = now + FRAME;
@@ -319,7 +317,7 @@ mod tests {
     fn screen(current: u32) -> Channel {
         Channel::new(
             "screen",
-            Settings { curve: SCREEN_CURVE, floor_pct: SCREEN_FLOOR_PCT, max: nits(500) },
+            Settings { curve: SCREEN_CURVE, floor_pct: SCREEN_FLOOR_PCT, max: nits(500), motion: SCREEN_MOTION },
             current,
         )
     }
@@ -350,7 +348,20 @@ mod tests {
 
     fn start_change(ch: &mut Channel, to: u32, t: Instant) {
         ch.target = to;
-        ch.ramp = Some(Ramp::new((ch.known as f32).ln_1p(), 0.0, to, t));
+        ch.ramp = Some(Ramp::new(ch.known, to, t));
+    }
+
+    /// Runs frames as the daemon would until `until`; returns the writes.
+    fn run_until(ch: &mut Channel, start: Instant, until: Instant) -> Vec<(f32, u32)> {
+        let mut out = Vec::new();
+        while let Some(at) = ch.next_frame().filter(|&at| at < until) {
+            if let Some(v) = ch.frame(at) {
+                ch.wrote(v);
+                ch.not_before(at + SCREEN_WRITE + WRITE_GAP);
+                out.push(((at - start).as_secs_f32(), v));
+            }
+        }
+        out
     }
 
     /// Runs frames until one writes, and returns (when, value).
@@ -374,7 +385,7 @@ mod tests {
 
     #[test]
     fn floor_and_ac_boost() {
-        let s = Settings { curve: SCREEN_CURVE, floor_pct: SCREEN_FLOOR_PCT, max: 500 };
+        let s = Settings { curve: SCREEN_CURVE, floor_pct: SCREEN_FLOOR_PCT, max: 500, motion: SCREEN_MOTION };
         assert_eq!(desired(&s, 0.0, 0.0), 125);
         assert_eq!(desired(&s, 300.0, 0.0), 350);
         assert_eq!(desired(&s, 300.0, AC_SCREEN_BOOST_PCT), 500);
@@ -404,86 +415,111 @@ mod tests {
         assert!(y > 100.0, "{y}");
     }
 
+    /// Largest written step allowed on the screen, in percent: 0.3 % plus
+    /// rounding to whole 1/16-nit units (0.05 % at 125 nits).
+    const MAX_PCT: f32 = 0.36;
+
     #[test]
-    fn a_change_takes_six_seconds_and_has_no_visible_step() {
+    fn screen_steps_stay_under_0_3_percent() {
         let t = Instant::now();
         let mut ch = screen(nits(140));
-        start_change(&mut ch, nits(301), t);
+        start_change(&mut ch, nits(315), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
         let (last_t, last_v) = *w.last().unwrap();
-        assert_eq!(last_v, nits(301));
-        assert!(last_t > 5.9 && last_t < 6.1, "{last_t}");
+        assert_eq!(last_v, nits(315));
+        assert!(last_t > 12.0 && last_t < 16.0, "{last_t}");
         assert!(w.windows(2).all(|p| p[0].1 < p[1].1));
         let pcts = step_pcts(nits(140), &w);
-        // Under 1 % even at full speed; the start and end creep.
-        assert!(pcts.iter().all(|&p| p < 1.0), "{pcts:?}");
-        assert!(pcts[..5].iter().all(|&p| p < 0.2), "{pcts:?}");
-        assert!(pcts[pcts.len() - 5..].iter().all(|&p| p < 0.2), "{pcts:?}");
+        assert!(pcts.iter().all(|&p| p < MAX_PCT), "{pcts:?}");
+        // It eases in and out.
+        assert!(pcts[0] < 0.05 && pcts[pcts.len() - 1] < 0.05, "{pcts:?}");
         assert!(ch.ramp.is_none());
     }
 
     #[test]
-    fn a_full_swing_stays_under_two_percent_a_step() {
+    fn a_full_swing_takes_about_24_seconds() {
         let t = Instant::now();
         let mut ch = screen(nits(125));
         assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(nits(500)));
         let w = run(&mut ch, t, SCREEN_WRITE);
+        let last_t = w.last().unwrap().0;
         assert_eq!(w.last().unwrap().1, nits(500));
-        assert!(step_pcts(nits(125), &w).iter().all(|&p| p < 2.0));
-        // Falls are the same curve the other way.
+        assert!(last_t > 20.0 && last_t < 27.0, "{last_t}");
+        assert!(step_pcts(nits(125), &w).iter().all(|&p| p < MAX_PCT));
+        // Falls are the same the other way.
         let mut ch = screen(nits(500));
         start_change(&mut ch, nits(125), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
         assert_eq!(w.last().unwrap().1, nits(125));
         assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
-        assert!(step_pcts(nits(500), &w).iter().all(|&p| p < 2.0));
+        assert!(step_pcts(nits(500), &w).iter().all(|&p| p < MAX_PCT));
     }
 
     #[test]
-    fn a_redirect_keeps_position_and_speed() {
+    fn a_small_change_is_quick() {
         let t = Instant::now();
-        let first = Ramp::new(141f32.ln(), 0.0, 400, t);
-        let mid = t + Duration::from_secs(2);
-        let (x, v) = (first.position(mid), first.speed(mid));
-        assert!(v > 0.0);
-        let second = Ramp::new(x, v, 450, mid);
-        assert!((second.position(mid) - x).abs() < 1e-6);
-        assert!((second.speed(mid) - v).abs() < 1e-4);
-        assert_eq!(second.value(mid + RAMP), 450);
+        let mut ch = screen(nits(300));
+        start_change(&mut ch, nits(306), t);
+        let w = run(&mut ch, t, SCREEN_WRITE);
+        assert_eq!(w.last().unwrap().1, nits(306));
+        assert!(w.last().unwrap().0 < 2.0, "{w:?}");
     }
 
     #[test]
-    fn a_redirect_never_overshoots() {
+    fn a_new_target_keeps_the_speed() {
         let t = Instant::now();
-        let first = Ramp::new(141f32.ln(), 0.0, 400, t);
-        let mid = t + Duration::from_secs(3);
-        // Moving fast toward 400, now asked to stop just ahead.
-        let near = first.value(mid) + 5;
-        let second = Ramp::new(first.position(mid), first.speed(mid), near, mid);
-        let mut s = mid;
-        while s < second.end() {
-            assert!(second.value(s) <= near, "{} > {near}", second.value(s));
-            s += Duration::from_millis(10);
-        }
-        // Asked to go back the other way: it starts from rest.
-        let back = Ramp::new(first.position(mid), first.speed(mid), 150, mid);
-        assert_eq!(back.speed(mid), 0.0);
-    }
-
-    #[test]
-    fn a_new_target_redirects_a_running_change() {
-        let t = Instant::now();
-        let mut ch = screen(nits(125));
+        let mut ch = screen(nits(140));
         ch.update(1000.0, 0.0, t);
-        let mid = t + Duration::from_secs(2);
-        let v = ch.ramp.as_ref().unwrap().value(mid);
+        let mid = t + Duration::from_secs(5);
+        let before = run_until(&mut ch, t, mid);
+        let speed = ch.ramp.as_ref().unwrap().speed();
         let due = ch.next_frame();
-        ch.update(300.0, 0.0, mid);
-        let r = ch.ramp.as_ref().unwrap();
-        assert_eq!(r.to, nits(350));
-        assert_eq!(r.value(mid), v);
-        // The beat goes on: no extra frame, no lost one.
+        assert_eq!(ch.update(300.0, 0.0, mid), Update::Moving(nits(350)));
+        assert_eq!(ch.ramp.as_ref().unwrap().speed(), speed);
         assert_eq!(ch.next_frame(), due);
+        let after = run(&mut ch, t, SCREEN_WRITE);
+        assert_eq!(after.last().unwrap().1, nits(350));
+        let all: Vec<_> = before.into_iter().chain(after).collect();
+        assert!(step_pcts(nits(140), &all).iter().all(|&p| p < MAX_PCT));
+    }
+
+    #[test]
+    fn turning_around_slows_down_first() {
+        let t = Instant::now();
+        let mut ch = screen(nits(140));
+        start_change(&mut ch, nits(400), t);
+        let mid = t + Duration::from_secs(6);
+        let before = run_until(&mut ch, t, mid);
+        let top = before.last().unwrap().1;
+        start_target(&mut ch, nits(150));
+        let after = run(&mut ch, t, SCREEN_WRITE);
+        // It goes on up a little, then comes back down, in small steps.
+        let peak = after.iter().map(|w| w.1).max().unwrap();
+        assert!(peak > top, "{top} {peak}");
+        assert_eq!(after.last().unwrap().1, nits(150));
+        let all: Vec<_> = before.into_iter().chain(after).collect();
+        assert!(step_pcts(nits(140), &all).iter().all(|&p| p < MAX_PCT));
+    }
+
+    #[test]
+    fn it_never_overshoots() {
+        let t = Instant::now();
+        let mut ch = screen(nits(140));
+        start_change(&mut ch, nits(400), t);
+        let mid = t + Duration::from_secs(6);
+        let before = run_until(&mut ch, t, mid);
+        // At full speed, now asked to stop just ahead.
+        let near = before.last().unwrap().1 + 16;
+        start_target(&mut ch, near);
+        let after = run(&mut ch, t, SCREEN_WRITE);
+        assert!(after.iter().all(|w| w.1 <= near), "{after:?}");
+        assert_eq!(after.last().unwrap().1, near);
+    }
+
+    /// Points a running change somewhere else, as update() does.
+    fn start_target(ch: &mut Channel, to: u32) {
+        ch.target = to;
+        ch.ramp.as_mut().unwrap().to = to;
     }
 
     #[test]
@@ -500,17 +536,19 @@ mod tests {
     }
 
     #[test]
-    fn the_keyboard_keeps_the_same_beat() {
+    fn the_keyboard_comes_on_in_about_six_seconds() {
         // LED writes are instant; they still come at most once a frame.
         let t = Instant::now();
         let mut kbd = Channel::new(
             "kbd",
-            Settings { curve: KBD_CURVE, floor_pct: KBD_FLOOR_PCT, max: 255 },
+            Settings { curve: KBD_CURVE, floor_pct: KBD_FLOOR_PCT, max: 255, motion: KBD_MOTION },
             0,
         );
         assert_eq!(kbd.update(0.0, 0.0, t), Update::Moving(191));
         let w = run(&mut kbd, t, Duration::ZERO);
         assert_eq!(w.last().unwrap().1, 191);
+        let last_t = w.last().unwrap().0;
+        assert!(last_t > 5.0 && last_t < 8.0, "{last_t}");
         assert!(w.windows(2).all(|p| p[1].0 - p[0].0 >= 0.0449), "{w:?}");
     }
 
