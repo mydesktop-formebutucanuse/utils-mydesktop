@@ -1,0 +1,103 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] drm/apple: count the panel backlight in 1/16 nit
+
+The backlight device counted whole nits, and a 1-nit step is clearly
+visible at low brightness (20 % at 5 nits, 0.8 % at 125). The nit-to-DAC
+tables are interpolated linearly anyway, so count in 1/16 nit instead:
+max_brightness becomes 16 times larger, whole nits give exactly the same
+DAC values as before, and the 15 values between two nits fall on the
+same lines. Checked for every value from 0 to 8144: whole nits match the
+old DAC bit for bit and the DAC never decreases.
+
+Tools that scale by max_brightness (logind, brightnessctl, desktop
+sliders) keep working; anything that wrote raw nits now gets 1/16 of
+them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/apple/dcp_backlight.c
++++ b/drivers/gpu/drm/apple/dcp_backlight.c
+@@ -20,6 +20,14 @@
+ #define MAX_BRIGHTNESS_PART2	510U
+ 
+ /*
++ * The backlight device counts in 1/BL_SUBSTEPS nit, so the brightness can
++ * change in steps much smaller than a nit (a 1-nit step is visible at low
++ * brightness). The DAC tables are interpolated linearly in any case; whole
++ * nits give exactly the same DAC values as before.
++ */
++#define BL_SUBSTEPS		16U
++
++/*
+  * lookup for display brightness 2 to 99 nits
+  * */
+ static u32 brightness_part1[] = {
+@@ -86,7 +94,7 @@
+ {
+ 	struct apple_dcp *dcp = bl_get_data(bd);
+ 
+-	return dcp->brightness.nits;
++	return dcp->brightness.nits * BL_SUBSTEPS;
+ }
+ 
+ #define SCALE_FACTOR (1 << 10)
+@@ -113,23 +121,27 @@
+ {
+ 	u32 dac;
+ 
+-	if (val <= MIN_BRIGHTNESS_PART1)
++	/* val is in 1/BL_SUBSTEPS nit */
++	if (val <= MIN_BRIGHTNESS_PART1 * BL_SUBSTEPS)
+ 		return 16 * brightness_part1[0];
+-	else if (val == MAX_BRIGHTNESS_PART1)
++	else if (val == MAX_BRIGHTNESS_PART1 * BL_SUBSTEPS)
+ 		return 16 * brightness_part1[ARRAY_SIZE(brightness_part1) - 1];
+-	else if (val == MIN_BRIGHTNESS_PART2)
++	else if (val == MIN_BRIGHTNESS_PART2 * BL_SUBSTEPS)
+ 		return 16 * brightness_part2[0];
+-	else if (val >= MAX_BRIGHTNESS_PART2)
++	else if (val >= MAX_BRIGHTNESS_PART2 * BL_SUBSTEPS)
+ 		return brightness_part2[ARRAY_SIZE(brightness_part2) - 1];
+ 
+-	if (val < MAX_BRIGHTNESS_PART1) {
+-		dac = interpolate(val, MIN_BRIGHTNESS_PART1, MAX_BRIGHTNESS_PART1,
++	if (val < MAX_BRIGHTNESS_PART1 * BL_SUBSTEPS) {
++		dac = interpolate(val, MIN_BRIGHTNESS_PART1 * BL_SUBSTEPS,
++				  MAX_BRIGHTNESS_PART1 * BL_SUBSTEPS,
+ 				  brightness_part1, ARRAY_SIZE(brightness_part1));
+-	} else if (val > MIN_BRIGHTNESS_PART2) {
+-		dac = interpolate(val, MIN_BRIGHTNESS_PART2, MAX_BRIGHTNESS_PART2,
++	} else if (val > MIN_BRIGHTNESS_PART2 * BL_SUBSTEPS) {
++		dac = interpolate(val, MIN_BRIGHTNESS_PART2 * BL_SUBSTEPS,
++				  MAX_BRIGHTNESS_PART2 * BL_SUBSTEPS,
+ 				  brightness_part2, ARRAY_SIZE(brightness_part2));
+ 	} else {
+-		dac = interpolate(val, MAX_BRIGHTNESS_PART1, MIN_BRIGHTNESS_PART2,
++		dac = interpolate(val, MAX_BRIGHTNESS_PART1 * BL_SUBSTEPS,
++				  MIN_BRIGHTNESS_PART2 * BL_SUBSTEPS,
+ 				  brightness_part12, ARRAY_SIZE(brightness_part12));
+ 	}
+ 
+@@ -230,10 +242,11 @@
+ 	struct backlight_device *bl_dev;
+ 	struct backlight_properties props = {
+ 		.type = BACKLIGHT_PLATFORM,
+-		.brightness = dcp->brightness.nits,
++		.brightness = dcp->brightness.nits * BL_SUBSTEPS,
+ 		.scale = BACKLIGHT_SCALE_LINEAR,
+ 	};
+-	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
++	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1) *
++			       BL_SUBSTEPS;
+ 
+ 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
+ 						&dcp_backlight_ops, &props);
+@@ -241,7 +254,7 @@
+ 		return PTR_ERR(bl_dev);
+ 
+ 	dcp->brightness.bl_dev = bl_dev;
+-	dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
++	dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits * BL_SUBSTEPS);
+ 
+ 	return 0;
+ }

@@ -42,10 +42,11 @@ cannot overlap: about 21 a second is the limit.
   dark to full brightness): it starts and ends gently. A change redirected
   midway keeps its position and speed, so it does not jerk, and never
   overshoots the new target. The file only takes whole units (nits for the
-  screen), so writes do not follow a fixed beat: each new whole value is
-  written at the moment the curve reaches it. In the dark that means one
-  unit at a time at an even pace; where the curve moves faster than about
-  21 writes a second, each write catches up to where the curve is.
+  screen, or 1/16 nit with the [kernel patch](../kernel)), so writes do not
+  follow a fixed beat: each new whole value is written at the moment the
+  curve reaches it. In the dark that means one unit at a time at an even
+  pace; where the curve moves faster than about 21 writes a second, each
+  write catches up to where the curve is.
   Keyboard writes, which are instant, are at least 20 ms apart.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is

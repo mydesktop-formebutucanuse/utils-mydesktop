@@ -8,6 +8,7 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 | [mediakeyd](mediakeyd) | Runs commands for volume, brightness and media keys without grabbing them, so focused windows do not flicker |
 | [backlight](backlight) | Changes the screen or keyboard backlight through logind, without root |
 | [autobrightd](autobrightd) | Sets the screen and keyboard backlight from the ambient light sensor, and steps aside when you change them |
+| [kernel](kernel) | Asahi kernel patch: the panel backlight in 1/16 nit, so brightness changes have no visible steps |
 
 ## Build
 
