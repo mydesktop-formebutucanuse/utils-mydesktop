@@ -259,8 +259,9 @@ impl Daemon {
                 say!("autobrightd: {}: light changed (lux {lux:.0}), automatic again", b.channel.name);
             }
             if let Update::Moving(to) = update {
+                let frames = b.channel.ramp.as_ref().map_or(0, |r| r.frames());
                 say!(
-                    "autobrightd: lux {raw:.0} (smoothed {lux:.0}): {} {} -> {to}",
+                    "autobrightd: lux {raw:.0} (smoothed {lux:.0}): {} {} -> {to} in {frames} frames",
                     b.channel.name, b.channel.known
                 );
             }

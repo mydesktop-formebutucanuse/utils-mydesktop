@@ -2,8 +2,8 @@
 //! Brightness logic without any I/O: curves, lux smoothing, the dead band,
 //! ramps and the manual-override rule.
 //!
-//! The curve points, the transition step and the override rule come from
-//! asahi-brightnessd (Craig Hughes) and juicecultus/asahi-auto-brightness.
+//! The curve points and the override rule come from asahi-brightnessd
+//! (Craig Hughes) and juicecultus/asahi-auto-brightness.
 //! Their MIT notice, which has to stay with copies of that work, is in NOTICE.
 
 use std::time::{Duration, Instant};
@@ -49,9 +49,13 @@ pub const FRAME: Duration = Duration::from_millis(45);
 /// by someone else that waited for the lock gets it in that time, so the
 /// next frame sees it instead of overwriting it.
 pub const WRITE_GAP: Duration = Duration::from_millis(1);
-/// Each frame moves 1/2^SMOOTH_SHIFT of the remaining gap, and at least one
-/// unit: asahi-brightnessd's transition, fast at first and slowing down.
-pub const SMOOTH_SHIFT: u32 = 4;
+/// Each frame changes the brightness by the same ratio, ln(1.015): 1.5 %
+/// everywhere on the scale. Eyes respond to ratios, so a log curve looks
+/// even from the dark to full brightness.
+pub const LOG_STEP: f32 = 0.0149;
+/// A change takes at most this many frames (about 4 s), so long ones such as
+/// the keyboard coming on from 0 do not crawl; their steps grow instead.
+pub const RAMP_MAX_FRAMES: u32 = 89;
 
 /// Automatic control comes back after a manual change once the light has
 /// moved this much (percent of the lux at the time of the change) ...
@@ -125,66 +129,42 @@ impl LuxFilter {
     }
 }
 
-/// One frame of a transition: 1/16 of the gap (rounded toward minus
-/// infinity, as an arithmetic shift does in the C original), at least 1.
-pub fn step_toward(current: u32, target: u32) -> u32 {
-    let delta = target as i64 - current as i64;
-    let step = match delta >> SMOOTH_SHIFT {
-        0 if delta > 0 => 1,
-        s if delta < 0 && s > -1 => -1,
-        s => s,
-    };
-    (current as i64 + step) as u32
-}
-
-/// A running change: where it goes and when its next frame is due.
-///
-/// Falling follows asahi-brightnessd: 1/16 of the remaining gap per frame,
-/// fast at first and slow toward the dark. Rising is asahi-brightnessd's
-/// own rise played backwards in time: the same steps, smallest first, so it
-/// starts with one-unit steps in the dark and speeds up toward the bright
-/// end.
+/// A running change: frames evenly spaced in ln(1 + brightness) from where
+/// it started to where it goes, and when the next one is due.
 pub struct Ramp {
     pub to: u32,
+    from_log: f32,
+    to_log: f32,
+    frames: u32,
+    done: u32,
     next_at: Instant,
-    /// For a rise, the values still to come, the next one last.
-    rise: Vec<u32>,
 }
 
 impl Ramp {
     pub fn new(from: u32, to: u32, next_at: Instant) -> Ramp {
-        // The original rise from `from` to `to`, as step sizes, biggest first.
-        let mut steps = Vec::new();
-        let mut v = from;
-        while v < to {
-            let next = step_toward(v, to);
-            steps.push(next - v);
-            v = next;
-        }
-        // The same steps smallest first, stored so that pop() gives the next.
-        let mut rise = Vec::with_capacity(steps.len());
-        let mut v = from;
-        for step in steps.iter().rev() {
-            v += step;
-            rise.push(v);
-        }
-        rise.reverse();
-        Ramp { to, next_at, rise }
+        let (from_log, to_log) = ((from as f32).ln_1p(), (to as f32).ln_1p());
+        let span = (to_log - from_log).abs();
+        let frames = ((span / LOG_STEP).ceil() as u32).clamp(1, RAMP_MAX_FRAMES);
+        Ramp { to, from_log, to_log, frames, done: 0, next_at }
+    }
+
+    pub fn frames(&self) -> u32 {
+        self.frames
     }
 
     pub fn next_at(&self) -> Instant {
         self.next_at
     }
 
-    /// The value for the frame starting at `now`, from what the file holds.
-    pub fn advance(&mut self, current: u32, now: Instant) -> u32 {
+    /// The value for the frame starting at `now`.
+    pub fn advance(&mut self, now: Instant) -> u32 {
         self.next_at = now + FRAME;
-        while let Some(v) = self.rise.pop() {
-            if v > current {
-                return v;
-            }
+        self.done = (self.done + 1).min(self.frames);
+        if self.done == self.frames {
+            return self.to;
         }
-        step_toward(current, self.to)
+        let p = self.done as f32 / self.frames as f32;
+        (self.from_log + (self.to_log - self.from_log) * p).exp_m1().round() as u32
     }
 }
 
@@ -262,7 +242,7 @@ impl Channel {
         if now < ramp.next_at() {
             return None;
         }
-        let value = ramp.advance(self.known, now);
+        let value = ramp.advance(now);
         if value == ramp.to {
             self.ramp = None;
         }
@@ -357,53 +337,49 @@ mod tests {
         assert!(y > 100.0, "{y}");
     }
 
-    #[test]
-    fn steps_are_a_sixteenth_of_the_gap() {
-        assert_eq!(step_toward(125, 500), 148);
-        assert_eq!(step_toward(500, 125), 476);
-        assert_eq!(step_toward(140, 155), 141);
-        assert_eq!(step_toward(155, 140), 154);
-        assert_eq!(step_toward(140, 140), 140);
+    /// Brightness ratio of each written step, in percent.
+    fn step_pcts(from: u32, written: &[u32]) -> Vec<f32> {
+        std::iter::once(from)
+            .chain(written.iter().copied())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|p| ((p[1] as f32).ln_1p() - (p[0] as f32).ln_1p()).abs() * 100.0)
+            .collect()
     }
 
     #[test]
-    fn a_fall_follows_the_original_curve() {
+    fn changes_move_evenly_in_log_space() {
         let t = Instant::now();
-        let mut ch = screen(500);
-        assert_eq!(ch.update(0.0, 0.0, t), Update::Moving(125));
-        let w = run_ramp(&mut ch, t);
-        // Fast from the bright end, one unit at a time into the dark.
-        assert_eq!(&w[..3], &[476, 454, 433]);
-        assert_eq!(&w[w.len() - 3..], &[127, 126, 125]);
-        assert!(w.windows(2).all(|p| p[0] > p[1]), "{w:?}");
-        assert!(ch.ramp.is_none());
+        let mut ch = screen(140);
+        ch.ramp = Some(Ramp::new(140, 303, t));
+        assert_eq!(ch.ramp.as_ref().map(Ramp::frames), Some(52));
+        let up = run_ramp(&mut ch, t);
+        assert_eq!(*up.last().unwrap(), 303);
+        assert!(up.windows(2).all(|p| p[0] < p[1]), "{up:?}");
+        let pcts = step_pcts(140, &up);
+        // 1.5 % a frame; whole units make it 0.7 to 2.1 % in the dark.
+        assert!(pcts.iter().all(|&p| p > 0.6 && p < 2.2), "{pcts:?}");
+
+        let mut ch = screen(303);
+        ch.ramp = Some(Ramp::new(303, 140, t));
+        let down = run_ramp(&mut ch, t);
+        assert_eq!(*down.last().unwrap(), 140);
+        assert!(down.windows(2).all(|p| p[0] > p[1]), "{down:?}");
+        assert!(step_pcts(303, &down).iter().all(|&p| p < 2.2));
     }
 
     #[test]
-    fn a_rise_is_the_original_rise_played_backwards() {
-        // asahi-brightnessd's rise from 125 to 500, as step sizes.
-        let mut original = Vec::new();
-        let mut v = 125;
-        while v < 500 {
-            let next = step_toward(v, 500);
-            original.push(next - v);
-            v = next;
-        }
-        assert_eq!((original.len(), original[0]), (73, 23));
-
+    fn long_changes_are_capped_at_four_seconds() {
         let t = Instant::now();
         let mut ch = screen(125);
         assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(500));
+        assert_eq!(ch.ramp.as_ref().map(Ramp::frames), Some(RAMP_MAX_FRAMES));
         let up = run_ramp(&mut ch, t);
-        let values: Vec<u32> = std::iter::once(125).chain(up.iter().copied()).collect();
-        let mut steps: Vec<u32> = values.windows(2).map(|p| p[1] - p[0]).collect();
-        steps.reverse();
-        // The same 73 steps in the opposite order: 1, 1, 1 ... 20, 22, 23.
-        assert_eq!(steps, original);
-        assert_eq!(&up[..3], &[126, 127, 128]);
-        assert_eq!(&up[up.len() - 3..], &[455, 477, 500]);
-        assert_eq!(ch.known, 500);
-        assert!(ch.ramp.is_none());
+        assert_eq!(*up.last().unwrap(), 500);
+        assert!(step_pcts(125, &up).iter().all(|&p| p < 2.5));
+        // The keyboard from off: 0 -> 191 would take 352 frames at 1.5 %.
+        let r = Ramp::new(0, 191, t);
+        assert_eq!(r.frames(), RAMP_MAX_FRAMES);
     }
 
     #[test]
@@ -411,11 +387,12 @@ mod tests {
         let t = Instant::now();
         let mut ch = screen(300);
         ch.ramp = Some(Ramp::new(300, 150, t));
-        assert_eq!(ch.frame(t), Some(290));
-        ch.wrote(290);
+        let first = ch.frame(t).unwrap();
+        assert!(first < 300);
+        ch.wrote(first);
         assert_eq!(ch.frame(t + FRAME / 2), None);
         assert_eq!(ch.next_frame(), Some(t + FRAME));
-        assert_eq!(ch.frame(t + FRAME), Some(281));
+        assert!(ch.frame(t + FRAME).is_some_and(|v| v < first));
     }
 
     #[test]
@@ -427,19 +404,18 @@ mod tests {
         ch.update(300.0, 0.0, t);
         assert_eq!(ch.ramp.as_ref().map(|r| r.to), Some(350));
         assert_eq!(ch.next_frame(), Some(at));
-        assert_eq!(ch.frame(at), Some(126));
+        assert!(ch.frame(at).is_some_and(|v| v > 125 && v < 130));
     }
 
     #[test]
     fn a_write_landing_after_ours_is_a_manual_change() {
-        // Seen on the M1 Pro: we write 225 (221 now that rises start slow),
-        // a key press that waited for the lock writes 200, and our read-back
-        // finds 200.
+        // Seen on the M1 Pro: we write 225, a key press that waited for the
+        // lock writes 200, and our read-back finds 200.
         let t = Instant::now();
         let mut ch = screen(220);
         ch.ramp = Some(Ramp::new(220, 304, t));
-        assert_eq!(ch.frame(t), Some(221));
-        ch.wrote(221);
+        let ours = ch.frame(t).unwrap();
+        ch.wrote(ours);
         assert!(ch.observe(200, 9.0));
         assert!(ch.ramp.is_none());
         assert_eq!((ch.known, ch.target), (200, 200));

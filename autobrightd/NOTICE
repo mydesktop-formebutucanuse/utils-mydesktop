@@ -1,8 +1,7 @@
 autobrightd is licensed under the GNU General Public License, version 3
 or later; see ../LICENSE.
 
-The curve points, the transition step (1/16 of the remaining gap per frame)
-and the manual-override rule in src/logic.rs come from
+The curve points and the manual-override rule in src/logic.rs come from
 asahi-brightnessd (https://github.com/craig-miller/asahi-brightnessd).
 Its license asks that the following notice be kept with copies of it:
 
