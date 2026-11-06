@@ -55,6 +55,17 @@ pub struct Motion {
     pub accel: f32,
 }
 
+impl Motion {
+    /// This motion, sped up if needed so that `dist` (ln units) takes at
+    /// most `secs`, speeding up and slowing down included. The time it
+    /// takes to reach top speed stays the same.
+    pub fn within(self, dist: f32, secs: f32) -> Motion {
+        let ease = self.speed / self.accel;
+        let speed = self.speed.max(dist / (secs - ease).max(0.1));
+        Motion { speed, accel: speed / ease }
+    }
+}
+
 /// Brightness changes are measured as ratios of (brightness + this much of
 /// the maximum). Pure ratios would make the bottom of the range endless:
 /// from 1/64 nit to 2 nits is as far as from 4 to 500. But the eye needs
@@ -69,8 +80,13 @@ pub const DARK_PCT: f32 = 3.0;
 /// roughly 1 % on a large bright field: 1 % steps did show. Top speed is
 /// reached, and given up, over 0.75 s. A small change takes about 0.75 s,
 /// 140 to 315 nits about 7.5 s, 25 % to 100 % about 12.5 s, and the lowest
-/// setting to 25 % about 20 s.
+/// setting to 25 % about 20 s, but see MAX_CHANGE.
 pub const SCREEN_MOTION: Motion = Motion { speed: 0.1125, accel: 0.1125 / 0.75 };
+/// No automatic change takes longer than this many seconds: one that would
+/// goes faster. A full swing (125 to 500 nits) then takes 8 s instead of
+/// 12, the lowest setting to 25 % 8 s instead of 20; smaller changes are as
+/// above.
+pub const MAX_CHANGE: f32 = 8.0;
 /// Nobody watches the keyboard fade, and from off every unit is a large
 /// ratio, so it moves much faster: off to 75 % in about 2 s.
 pub const KBD_MOTION: Motion = Motion { speed: 2.0, accel: 4.0 };
@@ -79,14 +95,17 @@ pub const KBD_MOTION: Motion = Motion { speed: 2.0, accel: 4.0 };
 /// presses, evenly spaced in the same ratio space as transitions, so every
 /// press looks the same size (macOS has 16 steps too).
 pub const KEY_STEPS: f32 = 16.0;
-/// A press glides there in about 0.65 s, easing in and out over 0.15 s:
-/// about 38 writes of at most 0.7 % with the kernel patches (2 % without
-/// them already looked smooth enough; 6-7 % looked choppy). Held down, the
-/// key sweeps the whole range in about 8 s.
-pub const KEY_MOTION: Motion = Motion { speed: 0.4167, accel: 0.4167 / 0.15 };
-/// Presses may run at most this many steps ahead of the brightness, so it
-/// stops soon after the key is let go.
+/// A press glides there in about 0.13 s, easing in and out over 0.03 s, in
+/// about 8 writes. Held down, the brightness moves on at this speed until
+/// the key is let go (the whole range in about 1.6 s), then stops within
+/// 0.03 s.
+pub const KEY_MOTION: Motion = Motion { speed: 2.083, accel: 2.083 / 0.03 };
+/// Presses in a row may run at most this many steps ahead of the brightness.
 const KEY_LEAD: f32 = 2.0;
+/// A held key that has sent no press or repeat for this long counts as let
+/// go, in case its release got lost. Longer than the first repeat delay of
+/// the brightness keys (300 ms in mediakeyd's example config).
+pub const KEY_HOLD_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// Time between writes while a change runs, about 60 a second. With the
 /// kernel patches (../kernel) a screen write returns at once and the driver
@@ -218,6 +237,26 @@ impl Ramp {
         self.speed
     }
 
+    /// The target in ln units.
+    fn target(&self) -> f32 {
+        (self.to as f32 + self.off).ln()
+    }
+
+    /// How far the target is, in ln units.
+    fn distance(&self) -> f32 {
+        (self.target() - self.pos).abs()
+    }
+
+    /// Where it would come to rest if it started slowing down now.
+    fn stopping_point(&self) -> f32 {
+        self.pos + self.speed * self.speed.abs() / (2.0 * self.motion.accel)
+    }
+
+    /// Heads for `x` (ln units), the nearest whole value.
+    fn head_for(&mut self, x: f32) {
+        self.to = (x.exp() - self.off).round().max(0.0) as u32;
+    }
+
     /// Moves on to `now`. Returns the whole value there, and whether the
     /// target has been reached.
     pub fn advance(&mut self, now: Instant) -> (u32, bool) {
@@ -253,6 +292,20 @@ pub struct Channel {
     pub ramp: Option<Ramp>,
     /// Smoothed lux when the user took over; None while automatic.
     pub override_lux: Option<f32>,
+    /// A brightness key that is down.
+    key: Option<KeyHold>,
+}
+
+/// A brightness key that is down. The brightness moves on in its direction
+/// until the key is let go.
+struct KeyHold {
+    /// +1 brighter, -1 dimmer.
+    dir: f32,
+    /// One step from where the press started (ln units). Letting go stops
+    /// the brightness at once, but not before this, so a tap is a whole step.
+    min_to: f32,
+    /// The last press or repeat.
+    last: Instant,
 }
 
 /// What happened when a sample was applied to a channel.
@@ -267,7 +320,7 @@ pub enum Update {
 
 impl Channel {
     pub fn new(name: &'static str, settings: Settings, current: u32) -> Channel {
-        Channel { name, settings, known: current, target: current, ramp: None, override_lux: None }
+        Channel { name, settings, known: current, target: current, ramp: None, override_lux: None, key: None }
     }
 
     /// A value read back from the brightness file. Returns true when someone
@@ -295,22 +348,22 @@ impl Channel {
         }
         let want = desired(&self.settings, lux, boost_pct);
         if worth_moving(self.target, want, self.settings.max) {
-            self.target = want;
-            match &mut self.ramp {
-                // Only where it heads changes; position, speed and beat stay.
-                Some(ramp) => {
-                    ramp.to = want;
-                    ramp.motion = self.settings.motion;
-                    ramp.by_key = false;
-                }
-                None => {
-                    let ramp = Ramp::new(self.known, want, &self.settings, self.settings.motion, now);
-                    self.ramp = Some(ramp);
-                }
-            }
+            self.head_for(want, now);
             result = Update::Moving(want);
         }
         result
+    }
+
+    /// Starts or redirects an automatic change toward `to`. Only where it
+    /// heads changes; position, speed and beat stay. It may go faster than
+    /// the channel's motion so as to take at most MAX_CHANGE.
+    pub fn head_for(&mut self, to: u32, now: Instant) {
+        self.target = to;
+        self.key = None;
+        let ramp = self.ramp.get_or_insert_with(|| Ramp::new(self.known, to, &self.settings, self.settings.motion, now));
+        ramp.to = to;
+        ramp.by_key = false;
+        ramp.motion = self.settings.motion.within(ramp.distance(), MAX_CHANGE);
     }
 
     /// When the next write is due, if a change is running.
@@ -321,10 +374,11 @@ impl Channel {
     /// The value to write now, if a write is due and the change has moved
     /// away from what the file holds.
     pub fn frame(&mut self, now: Instant) -> Option<u32> {
-        let ramp = self.ramp.as_mut()?;
-        if now < ramp.next_at {
+        if now < self.ramp.as_ref()?.next_at {
             return None;
         }
+        self.keep_key_moving(now);
+        let ramp = self.ramp.as_mut()?;
         let (value, arrived) = ramp.advance(now);
         if arrived {
             self.ramp = None;
@@ -334,16 +388,31 @@ impl Channel {
         (value != self.known).then_some(value)
     }
 
-    /// Brightness keys: `presses` steps up (+) or down (-). A step is
-    /// 1/KEY_STEPS of the way from the lowest level that shows (the top of
-    /// the dead zone) to the maximum, in the ratio space of transitions, so
-    /// each press looks the same size. The brightness glides there quickly
-    /// (KEY_MOTION), and, as after any manual change, the light is left
-    /// alone until it changes a lot. Returns the new target.
-    pub fn key_step(&mut self, presses: i32, lux: f32, now: Instant) -> u32 {
+    /// The range brightness keys move in, (lowest, highest) in ln units:
+    /// from the lowest level that shows (the top of the dead zone) to the
+    /// maximum.
+    fn key_range(&self) -> (f32, f32) {
         let off = dark_offset(&self.settings);
         let lowest = self.settings.dead_zone.max(1);
-        let (lo, hi) = ((lowest as f32 + off).ln(), (self.settings.max as f32 + off).ln());
+        ((lowest as f32 + off).ln(), (self.settings.max as f32 + off).ln())
+    }
+
+    /// Brightness keys: `presses` steps up (+) or down (-). A step is
+    /// 1/KEY_STEPS of the key range, in the ratio space of transitions, so
+    /// each press looks the same size. The brightness glides there quickly
+    /// (KEY_MOTION) and, while the key stays down, moves on until it is let
+    /// go (key_release). As after any manual change, the light is then left
+    /// alone until it changes a lot. A repeat of a key that is down only
+    /// shows that it still is. Returns the new target.
+    pub fn key_step(&mut self, presses: i32, lux: f32, now: Instant) -> u32 {
+        let dir = presses.signum() as f32;
+        if let Some(hold) = self.key.as_mut().filter(|h| h.dir == dir) {
+            hold.last = now;
+            return self.target;
+        }
+        let off = dark_offset(&self.settings);
+        let lowest = self.settings.dead_zone.max(1);
+        let (lo, hi) = self.key_range();
         let step = (hi - lo) / KEY_STEPS;
         let (pos, base) = match &self.ramp {
             // Presses during a key glide add up from where it heads.
@@ -364,11 +433,45 @@ impl Channel {
         };
         self.target = to;
         self.override_lux = Some(lux);
+        self.key = Some(KeyHold { dir, min_to: want, last: now });
         let ramp = self.ramp.get_or_insert_with(|| Ramp::new(self.known, to, &self.settings, KEY_MOTION, now));
         ramp.to = to;
         ramp.motion = KEY_MOTION;
         ramp.by_key = true;
         to
+    }
+
+    /// The brightness key was let go: stop as soon as the motion allows,
+    /// but not before the whole step of the press.
+    pub fn key_release(&mut self) {
+        let Some(hold) = self.key.take() else { return };
+        let (lo, hi) = self.key_range();
+        let Some(ramp) = self.ramp.as_mut().filter(|r| r.by_key) else { return };
+        let stop = ramp.stopping_point();
+        let x = if (stop - hold.min_to) * hold.dir >= 0.0 { stop } else { hold.min_to };
+        ramp.head_for(x.clamp(lo, hi));
+        self.target = ramp.to;
+    }
+
+    /// While a key is down, keeps the target just far enough ahead that the
+    /// brightness moves on at full speed; a key with no press or repeat for
+    /// KEY_HOLD_TIMEOUT counts as let go.
+    fn keep_key_moving(&mut self, now: Instant) {
+        let Some(hold) = &self.key else { return };
+        if now.saturating_duration_since(hold.last) > KEY_HOLD_TIMEOUT {
+            self.key_release();
+            return;
+        }
+        let (dir, min_to) = (hold.dir, hold.min_to);
+        let (lo, hi) = self.key_range();
+        let Some(ramp) = self.ramp.as_mut().filter(|r| r.by_key) else { return };
+        // What it needs to stop from full speed, plus a few frames.
+        let m = ramp.motion;
+        let lead = m.speed * m.speed / (2.0 * m.accel) + m.speed * 0.05;
+        let ahead = ramp.pos + dir * lead;
+        let x = if (ahead - min_to) * dir >= 0.0 { ahead } else { min_to };
+        ramp.head_for(x.clamp(lo, hi));
+        self.target = ramp.to;
     }
 
     /// Records a successful write of `value`. Read the file back afterwards
@@ -388,6 +491,7 @@ impl Channel {
     /// Ends any change where it is, so the next update starts from here.
     pub fn stop(&mut self) {
         self.ramp = None;
+        self.key = None;
         self.target = self.known;
     }
 }
@@ -552,23 +656,48 @@ mod tests {
         assert!(ch.ramp.is_none());
     }
 
+    /// Largest step of a change sped up to take MAX_CHANGE, in percent:
+    /// a full swing goes at 0.18 ln/s, 0.32 % a write.
+    const FAST_PCT: f32 = 0.36;
+
     #[test]
-    fn a_full_swing_takes_about_12_seconds() {
+    fn a_full_swing_takes_8_seconds() {
+        // 12 s at the screen's own speed; MAX_CHANGE makes it faster.
         let t = Instant::now();
         let mut ch = screen(nits(125));
         assert_eq!(ch.update(1000.0, 0.0, t), Update::Moving(nits(500)));
         let w = run(&mut ch, t, SCREEN_WRITE);
         let last_t = w.last().unwrap().0;
         assert_eq!(w.last().unwrap().1, nits(500));
-        assert!(last_t > 10.0 && last_t < 13.5, "{last_t}");
-        assert!(step_pcts(nits(125), &w).iter().all(|&p| p < MAX_PCT));
+        assert!(last_t > 7.5 && last_t < 8.1, "{last_t}");
+        assert!(step_pcts(nits(125), &w).iter().all(|&p| p < FAST_PCT));
         // Falls are the same the other way.
         let mut ch = screen(nits(500));
-        start_change(&mut ch, nits(125), t);
+        ch.head_for(nits(125), t);
         let w = run(&mut ch, t, SCREEN_WRITE);
         assert_eq!(w.last().unwrap().1, nits(125));
+        assert!(w.last().unwrap().0 < 8.1);
         assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
-        assert!(step_pcts(nits(500), &w).iter().all(|&p| p < MAX_PCT));
+        assert!(step_pcts(nits(500), &w).iter().all(|&p| p < FAST_PCT));
+    }
+
+    #[test]
+    fn no_automatic_change_takes_longer_than_8_seconds() {
+        // From the lowest setting to the 25 % floor took 20 s; the whole
+        // range (the largest change) goes at 0.47 ln/s, 0.85 % a write.
+        let t = Instant::now();
+        for (from, to) in [(1, nits(125)), (nits(2), nits(500)), (nits(500), nits(2))] {
+            let mut ch = screen(from);
+            ch.head_for(to, t);
+            let w = run(&mut ch, t, SCREEN_WRITE);
+            assert_eq!(w.last().unwrap().1, to);
+            assert!(w.last().unwrap().0 < 8.1, "{from} {to} {}", w.last().unwrap().0);
+            assert!(motion_pcts(from, &w).iter().skip(1).all(|&p| p < 0.9), "{from} {to}");
+        }
+        // Changes that already take less are not sped up.
+        let mut ch = screen(nits(140));
+        ch.head_for(nits(315), t);
+        assert_eq!(ch.ramp.as_ref().unwrap().motion.speed, SCREEN_MOTION.speed);
     }
 
     #[test]
@@ -619,7 +748,7 @@ mod tests {
         let after = run(&mut ch, t, SCREEN_WRITE);
         assert_eq!(after.last().unwrap().1, nits(350));
         let all: Vec<_> = before.into_iter().chain(after).collect();
-        assert!(step_pcts(nits(140), &all).iter().all(|&p| p < MAX_PCT));
+        assert!(step_pcts(nits(140), &all).iter().all(|&p| p < FAST_PCT));
     }
 
     #[test]
@@ -661,13 +790,40 @@ mod tests {
         ch.ramp.as_mut().unwrap().to = to;
     }
 
-    /// Screen value after `n` presses up from the lowest level.
+    /// A tap: a press, let go at once. Returns the writes.
+    fn tap(ch: &mut Channel, presses: i32, t: Instant) -> Vec<(f32, u32)> {
+        ch.key_step(presses, 10.0, t);
+        ch.key_release();
+        run(ch, t, SCREEN_WRITE)
+    }
+
+    /// Holds a key from `t` for `secs` with mediakeyd's repeats (after
+    /// 300 ms, every 40 ms), then lets it go if `release`. Returns the
+    /// writes to the end of the motion.
+    fn hold(ch: &mut Channel, dir: i32, t: Instant, secs: f32, release: bool) -> Vec<(f32, u32)> {
+        let end = t + Duration::from_secs_f32(secs);
+        ch.key_step(dir, 10.0, t);
+        let mut writes = Vec::new();
+        let mut at = t + Duration::from_millis(300);
+        while at < end {
+            writes.extend(run_until(ch, t, at));
+            ch.key_step(dir, 10.0, at);
+            at += Duration::from_millis(40);
+        }
+        writes.extend(run_until(ch, t, end));
+        if release {
+            ch.key_release();
+        }
+        writes.extend(run(ch, t, SCREEN_WRITE));
+        writes
+    }
+
+    /// Screen value after `n` taps up from the lowest level.
     fn key_level(n: i32) -> u32 {
         let t = Instant::now();
         let mut ch = screen(nits(2));
         for _ in 0..n {
-            ch.key_step(1, 10.0, t);
-            run(&mut ch, t, SCREEN_WRITE);
+            tap(&mut ch, 1, t);
         }
         ch.known
     }
@@ -689,16 +845,15 @@ mod tests {
     }
 
     #[test]
-    fn a_press_glides_in_small_steps() {
+    fn a_tap_glides_one_step_in_about_0_13_seconds() {
         let t = Instant::now();
         let mut ch = screen(nits(300));
-        let to = ch.key_step(-1, 10.0, t);
-        let w = run(&mut ch, t, SCREEN_WRITE);
-        assert_eq!(w.last().unwrap().1, to);
+        let w = tap(&mut ch, -1, t);
+        assert_eq!(w.last().unwrap().1, ch.target);
         let last_t = w.last().unwrap().0;
-        assert!(last_t > 0.5 && last_t < 0.8, "{last_t} {w:?}");
-        assert!(w.len() >= 30, "{w:?}");
-        assert!(step_pcts(nits(300), &w).iter().all(|&p| p < 0.8), "{w:?}");
+        assert!(last_t > 0.1 && last_t < 0.2, "{last_t} {w:?}");
+        assert!(w.len() >= 6, "{w:?}");
+        assert!(step_pcts(nits(300), &w).iter().all(|&p| p < 4.2), "{w:?}");
         assert!(w.windows(2).all(|p| p[0].1 > p[1].1));
         // A manual change: the light is left alone until it changes a lot.
         assert_eq!(ch.update(12.0, 30.0, t), Update::Nothing);
@@ -706,39 +861,51 @@ mod tests {
     }
 
     #[test]
-    fn holding_a_key_moves_steadily_and_stops_soon_after() {
-        // mediakeyd repeats every 40 ms after 660 ms; hold for 3 s.
+    fn holding_a_key_moves_on_until_it_is_let_go() {
         let t = Instant::now();
         let mut ch = screen(nits(20));
-        let mut presses = vec![t];
-        let mut at = t + Duration::from_millis(660);
-        while at < t + Duration::from_millis(3000) {
-            presses.push(at);
-            at += Duration::from_millis(40);
-        }
-        let mut writes = Vec::new();
-        for &p in &presses {
-            writes.extend(run_until(&mut ch, t, p));
-            ch.key_step(1, 10.0, p);
-        }
-        let release = (*presses.last().unwrap() - t).as_secs_f32();
-        writes.extend(run(&mut ch, t, SCREEN_WRITE));
-        let end = writes.last().unwrap().0;
-        assert!(end - release < 1.2, "{end} {release}");
-        assert!(writes.windows(2).all(|p| p[0].1 < p[1].1));
-        // 0.7 % a write in the motion space (more in plain ratios at 20
-        // nits, where the eye needs it).
-        assert!(motion_pcts(nits(20), &writes).iter().all(|&p| p < 0.75), "{writes:?}");
-        // About 0.42 ln units a second: well up, but not at the top yet.
-        assert!(ch.known > nits(100) && ch.known < nits(500), "{}", ch.known);
+        let w = hold(&mut ch, 1, t, 0.8, true);
+        assert!(w.windows(2).all(|p| p[0].1 < p[1].1));
+        // Full speed from 0.05 s on, about 3.7 % a write in the motion
+        // space, with no dip when the repeats start at 0.3 s ...
+        let m = motion_pcts(nits(20), &w);
+        let steady: Vec<f32> = w.iter().zip(&m).filter(|(x, _)| x.0 > 0.05 && x.0 < 0.78).map(|(_, &p)| p).collect();
+        assert!(steady.iter().all(|&p| p > 3.0 && p < 4.0), "{steady:?}");
+        // ... and it stops in the frame after the key is let go.
+        let end = w.last().unwrap().0;
+        assert!(end < 0.83, "{end}");
+        // 0.8 s at 2.08 ln/s from 20 nits.
+        assert!(ch.ramp.is_none() && ch.known > nits(140) && ch.known < nits(190), "{}", ch.known);
+    }
+
+    #[test]
+    fn letting_go_early_still_finishes_the_step() {
+        let t = Instant::now();
+        let mut a = screen(nits(300));
+        let tapped = tap(&mut a, -1, t).last().unwrap().1;
+        let mut b = screen(nits(300));
+        let held = hold(&mut b, -1, t, 0.05, true).last().unwrap().1;
+        assert_eq!(held, tapped);
+    }
+
+    #[test]
+    fn a_lost_release_stops_after_the_timeout() {
+        // The last repeat comes at 0.46 s; nothing after it.
+        let t = Instant::now();
+        let mut ch = screen(nits(20));
+        let w = hold(&mut ch, 1, t, 0.5, false);
+        let end = w.last().unwrap().0;
+        assert!(end > 0.84 && end < 0.92, "{end}");
+        assert!(ch.ramp.is_none());
     }
 
     #[test]
     fn a_press_at_the_bottom_stays_there() {
         let t = Instant::now();
         let mut ch = screen(nits(2));
-        assert_eq!(ch.key_step(-1, 10.0, t), nits(2));
-        assert!(run(&mut ch, t, SCREEN_WRITE).is_empty());
+        assert!(tap(&mut ch, -1, t).is_empty());
+        assert_eq!(ch.known, nits(2));
+        assert!(hold(&mut ch, -1, t, 0.6, true).is_empty());
         let mut ch = screen(1);
         assert_eq!(ch.key_step(-3, 10.0, t), nits(2));
     }

@@ -114,6 +114,7 @@ unsafe extern "C" {
     fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
     fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
     fn signal(signum: c_int, handler: usize) -> usize;
+    fn __libc_current_sigrtmin() -> c_int;
     fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
     fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
 }
@@ -122,7 +123,11 @@ unsafe extern "C" {
 static KEY_PIPE: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_key_signal(sig: c_int) {
-    let byte = if sig == SIGUSR1 { b'+' } else { b'-' };
+    let byte = match sig {
+        SIGUSR1 => b'+',
+        SIGUSR2 => b'-',
+        _ => b'r',
+    };
     let fd = KEY_PIPE.load(Ordering::Relaxed);
     if fd >= 0 {
         // SAFETY: write() is async-signal-safe; one byte from a local.
@@ -130,9 +135,21 @@ extern "C" fn on_key_signal(sig: c_int) {
     }
 }
 
-/// Brightness keys arrive as signals: SIGUSR1 for brighter, SIGUSR2 for
-/// dimmer (sent by the backlight script). The handler writes a byte into a
-/// pipe, which poll() watches, so no press is missed between two polls.
+/// A brightness key event.
+#[derive(Debug, PartialEq)]
+pub enum KeyEvent {
+    /// Presses (or repeats): positive brighter, negative dimmer.
+    Press(i32),
+    /// The key was let go.
+    Release,
+}
+
+/// Brightness keys arrive as signals, sent by the backlight script:
+/// SIGUSR1 for brighter, SIGUSR2 for dimmer, SIGRTMIN when the key is let
+/// go. The handler writes a byte into a pipe, which poll() watches, so no
+/// press is missed between two polls, and their order is kept. (When a
+/// press and a release are pending at once, the kernel delivers the lower
+/// signal number, the press, first.)
 pub struct KeySignals {
     read: OwnedFd,
     _write: OwnedFd,
@@ -156,6 +173,7 @@ impl KeySignals {
         unsafe {
             signal(SIGUSR1, handler);
             signal(SIGUSR2, handler);
+            signal(__libc_current_sigrtmin(), handler);
         }
         Ok(KeySignals { read, _write: write })
     }
@@ -164,18 +182,30 @@ impl KeySignals {
         self.read.as_raw_fd()
     }
 
-    /// Presses since the last call: + brighter, - dimmer.
-    pub fn drain(&self) -> i32 {
-        let mut net = 0;
+    /// Key events since the last call, in order. Presses in a row in the
+    /// same direction are added up.
+    pub fn drain(&self) -> Vec<KeyEvent> {
+        let mut events = Vec::new();
         let mut buf = [0u8; 64];
         loop {
             // SAFETY: buf is valid for its length; the pipe is non-blocking.
             let n = unsafe { read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
-                return net;
+                return events;
             }
             for &b in &buf[..n as usize] {
-                net += if b == b'+' { 1 } else { -1 };
+                let dir = match b {
+                    b'+' => 1,
+                    b'-' => -1,
+                    _ => {
+                        events.push(KeyEvent::Release);
+                        continue;
+                    }
+                };
+                match events.last_mut() {
+                    Some(KeyEvent::Press(n)) if n.signum() == dir => *n += dir,
+                    _ => events.push(KeyEvent::Press(dir)),
+                }
             }
         }
     }

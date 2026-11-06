@@ -25,7 +25,7 @@ use logic::{Channel, LuxFilter, Settings, Update};
 use std::path::Path;
 use std::process::exit;
 use std::time::{Duration, Instant};
-use sys::{Attr, KeySignals, Uevents};
+use sys::{Attr, KeyEvent, KeySignals, Uevents};
 
 const ALS_NAME: &str = "aop-sensors-als";
 const SCREEN_DIR: &str = "/sys/class/backlight/apple-panel-bl";
@@ -370,10 +370,19 @@ impl Daemon {
                 }
             };
             if ready.keys {
-                let presses = self.keys.as_ref().map_or(0, KeySignals::drain);
-                if presses != 0 {
-                    let to = self.screen.channel.key_step(presses, self.lux, Instant::now());
-                    self.log(format_args!("brightness key {presses:+}: screen -> {to}"));
+                let events = self.keys.as_ref().map_or_else(Vec::new, KeySignals::drain);
+                for event in events {
+                    match event {
+                        KeyEvent::Press(presses) => {
+                            let to = self.screen.channel.key_step(presses, self.lux, Instant::now());
+                            self.log(format_args!("brightness key {presses:+}: screen -> {to}"));
+                        }
+                        KeyEvent::Release => {
+                            self.screen.channel.key_release();
+                            let to = self.screen.channel.target;
+                            self.log(format_args!("brightness key let go: screen -> {to}"));
+                        }
+                    }
                 }
             }
             if ready.notify {

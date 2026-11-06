@@ -1,13 +1,14 @@
 # mediakeyd config (~/.config/mediakeyd/config)
 #
-#   KEYSYM  repeat|repeat=MS|once  COMMAND
+#   KEYSYM  once|repeat|repeat=MS|release  COMMAND
 #
 # COMMAND runs with /bin/sh -c. Keys are not grabbed, so the focused
 # application still receives them. "repeat" keys repeat at the X server's
 # rate (xset r rate) while they are held down; "repeat=MS" starts repeating
-# after MS milliseconds instead of the server's delay. A key's command never
-# runs twice at the same time; presses during a run are merged into one more
-# run.
+# after MS milliseconds instead of the server's delay. "release" runs
+# COMMAND when the key is let go (after its press command has finished). A
+# key's command never runs twice at the same time; presses during a run are
+# merged into one more run.
 
 # Volume (PipeWire). Raising the volume also unmutes, capped at 100%.
 XF86AudioRaiseVolume   repeat  wpctl set-mute @DEFAULT_AUDIO_SINK@ 0; wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+
@@ -15,14 +16,16 @@ XF86AudioLowerVolume   repeat  wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
 XF86AudioMute          once    wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 
 # Screen brightness (16 even steps, through autobrightd) and keyboard
-# backlight (elogind, no root). A press glides one step in about 0.65 s;
-# held, the screen key repeats after 300 ms, while the first step is still
-# moving at full speed, so it runs on without stopping (after the server's
-# 660 ms it had come to rest and started again).
+# backlight (elogind, no root). A tap glides one step of the screen; held,
+# it moves on until the key is let go ("release"), then stops at once. The
+# repeats only show autobrightd that the key is still down (if a release
+# got lost, it stops 0.4 s after the last one), so they start after 300 ms.
 # backlight is backlight/backlight of utils-mydesktop (in /usr/bin with the
 # Gentoo package).
 XF86MonBrightnessUp    repeat=300  backlight screen +5
 XF86MonBrightnessDown  repeat=300  backlight screen -5
+XF86MonBrightnessUp    release     backlight screen release
+XF86MonBrightnessDown  release     backlight screen release
 XF86KbdBrightnessUp    repeat  backlight kbd +10
 XF86KbdBrightnessDown  repeat  backlight kbd -10
 

@@ -5,26 +5,32 @@
 #   backlight screen +N|-N   one step brighter or dimmer. autobrightd does
 #                            the change: 16 steps from 2 nits to the
 #                            maximum, even as the eye sees them, each one a
-#                            short glide. N only gives the direction.
+#                            short glide that goes on while the key is down.
+#                            N only gives the direction.
+#   backlight screen release the key was let go: the brightness stops
+#                            (after at least one whole step).
 #   backlight kbd +N|-N      keyboard backlight by N % of its maximum,
 #                            through elogind's Session.SetBrightness.
 set -eu
 
 usage() {
-	echo "usage: ${0##*/} screen|kbd +N|-N" >&2
+	echo "usage: ${0##*/} screen +N|-N|release" >&2
+	echo "       ${0##*/} kbd +N|-N" >&2
 	exit 2
 }
 
 pct=${2:-}
-case "$pct" in
-[+-][0-9]*) ;;
+case "${1:-}:$pct" in
+screen:release | *:[+-][0-9]*) ;;
 *) usage ;;
 esac
 
 case "${1:-}" in
 screen)
-	# autobrightd takes SIGUSR1 as brighter and SIGUSR2 as dimmer.
+	# autobrightd takes SIGUSR1 as brighter, SIGUSR2 as dimmer and
+	# SIGRTMIN as the key being let go.
 	case "$pct" in
+	release) sig=RTMIN ;;
 	-*) sig=USR2 ;;
 	*) sig=USR1 ;;
 	esac

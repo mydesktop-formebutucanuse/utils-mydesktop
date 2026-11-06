@@ -12,7 +12,9 @@
 //!
 //! Raw events carry no autorepeat, so keys marked `repeat` are repeated here
 //! with the X server's repeat delay and rate for as long as they are down;
-//! `repeat=MS` sets the delay before the first repeat for one key.
+//! `repeat=MS` sets the delay before the first repeat for one key. Keys
+//! marked `release` run their command when they are let go, after the
+//! key's own press command has finished.
 //! A key's command never runs twice at the same time: presses that arrive
 //! while it runs are merged into one more run after it finishes.
 
@@ -32,20 +34,22 @@ const CHILD_POLL: Duration = Duration::from_millis(5);
 /// Used when the X server does not report its repeat settings.
 const DEFAULT_REPEAT: (Duration, Duration) = (Duration::from_millis(660), Duration::from_millis(40));
 
-/// Whether and when a key that is held down repeats.
+/// When a binding's command runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Repeat {
+enum Mode {
+    /// Once per press.
     Once,
-    /// After the X server's repeat delay.
-    ServerDelay,
-    /// After this delay. The interval is still the X server's.
-    After(Duration),
+    /// On a press, then repeatedly while the key is down: after the X
+    /// server's repeat delay, or after this one, at the server's interval.
+    Repeat(Option<Duration>),
+    /// When the key is let go.
+    Release,
 }
 
 struct Binding {
     name: String,
     keysym: KeySym,
-    repeat: Repeat,
+    mode: Mode,
     command: String,
     child: Option<Child>,
     pending: bool,
@@ -80,20 +84,22 @@ fn split_word(s: &str) -> (&str, &str) {
     }
 }
 
-/// The mode word of a config line: `once`, `repeat` or `repeat=MS`.
-fn parse_mode(mode: &str) -> Option<Repeat> {
+/// The mode word of a config line: `once`, `repeat`, `repeat=MS` or
+/// `release`.
+fn parse_mode(mode: &str) -> Option<Mode> {
     match mode {
-        "once" => Some(Repeat::Once),
-        "repeat" => Some(Repeat::ServerDelay),
+        "once" => Some(Mode::Once),
+        "repeat" => Some(Mode::Repeat(None)),
+        "release" => Some(Mode::Release),
         _ => match mode.strip_prefix("repeat=")?.parse::<u64>() {
-            Ok(ms @ 1..=10_000) => Some(Repeat::After(Duration::from_millis(ms))),
+            Ok(ms @ 1..=10_000) => Some(Mode::Repeat(Some(Duration::from_millis(ms)))),
             _ => None,
         },
     }
 }
 
-/// Config lines: `KEYSYM repeat|repeat=MS|once COMMAND`, `#` starts a
-/// comment line.
+/// Config lines: `KEYSYM once|repeat|repeat=MS|release COMMAND`, `#` starts
+/// a comment line. A key can have a press binding and a release binding.
 fn parse_config(path: &str) -> Result<Vec<Binding>, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let mut bindings = Vec::new();
@@ -106,8 +112,9 @@ fn parse_config(path: &str) -> Result<Vec<Binding>, String> {
         let err = |what: &str| format!("{path}:{}: {what}", n + 1);
         let (name, rest) = split_word(line);
         let (mode, command) = split_word(rest);
-        let repeat = parse_mode(mode)
-            .ok_or_else(|| err("expected `repeat`, `repeat=MS` (1 to 10000) or `once` after the keysym"))?;
+        let mode = parse_mode(mode).ok_or_else(|| {
+            err("expected `once`, `repeat`, `repeat=MS` (1 to 10000) or `release` after the keysym")
+        })?;
         if command.is_empty() {
             return Err(err("missing command"));
         }
@@ -119,7 +126,7 @@ fn parse_config(path: &str) -> Result<Vec<Binding>, String> {
         bindings.push(Binding {
             name: name.to_string(),
             keysym,
-            repeat,
+            mode,
             command: command.to_string(),
             child: None,
             pending: false,
@@ -156,16 +163,44 @@ fn select_raw_keys(dpy: *mut Display) -> Result<c_int, &'static str> {
     Ok(opcode)
 }
 
-/// Maps keycodes to bindings with the current keyboard map.
-fn keycode_table(dpy: *mut Display, bindings: &[Binding]) -> [Option<usize>; 256] {
-    let mut table = [None; 256];
+/// Bindings by keycode, with the current keyboard map.
+struct Keys {
+    /// Run when the key is pressed (`once`, `repeat`).
+    press: [Option<usize>; 256],
+    /// Run when it is let go (`release`).
+    release: [Option<usize>; 256],
+}
+
+fn keycode_table(dpy: *mut Display, bindings: &[Binding]) -> Keys {
+    let mut keys = Keys { press: [None; 256], release: [None; 256] };
     for (i, b) in bindings.iter().enumerate() {
         match unsafe { XKeysymToKeycode(dpy, b.keysym) } {
             0 => eprintln!("mediakeyd: {} is not on the keyboard map", b.name),
-            kc => table[kc as usize] = Some(i),
+            kc if b.mode == Mode::Release => keys.release[kc as usize] = Some(i),
+            kc => keys.press[kc as usize] = Some(i),
         }
     }
-    table
+    keys
+}
+
+/// Whether a binding's command runs or is queued to run again.
+fn busy(b: &Binding) -> bool {
+    b.child.is_some() || b.pending
+}
+
+/// A key was let go: runs its release binding, or queues it in `waiting`
+/// until the key's press command has finished, so that the release always
+/// comes after the last press.
+fn release(keys: &Keys, bindings: &mut [Binding], waiting: &mut Vec<(usize, Option<usize>)>, keycode: u8) {
+    let Some(r) = keys.release[keycode as usize] else { return };
+    let p = keys.press[keycode as usize];
+    if p.is_some_and(|p| busy(&bindings[p])) {
+        if !waiting.iter().any(|w| w.0 == r) {
+            waiting.push((r, p));
+        }
+    } else {
+        fire(&mut bindings[r]);
+    }
 }
 
 /// Returns `(evtype, keycode)` for an XInput raw key event.
@@ -261,8 +296,10 @@ fn main() {
         die("cannot open the X display");
     }
     let opcode = select_raw_keys(dpy).unwrap_or_else(|e| die(e));
-    let mut table = keycode_table(dpy, &bindings);
+    let mut keys = keycode_table(dpy, &bindings);
     let mut held: Vec<Held> = Vec::new();
+    // Release bindings waiting for their key's press command to finish.
+    let mut waiting: Vec<(usize, Option<usize>)> = Vec::new();
     let fd = unsafe { XConnectionNumber(dpy) };
 
     loop {
@@ -272,16 +309,17 @@ fn main() {
             match ev.kind() {
                 MAPPING_NOTIFY => {
                     unsafe { XRefreshKeyboardMapping(&mut ev) };
-                    table = keycode_table(dpy, &bindings);
+                    keys = keycode_table(dpy, &bindings);
                     held.clear();
                 }
                 GENERIC_EVENT => {
                     let Some((evtype, keycode)) = raw_key(dpy, &mut ev, opcode) else { continue };
-                    let Some(i) = table[keycode as usize] else { continue };
                     if evtype == XI_RAW_KEY_RELEASE {
                         held.retain(|h| h.keycode != keycode);
+                        release(&keys, &mut bindings, &mut waiting, keycode);
                         continue;
                     }
+                    let Some(i) = keys.press[keycode as usize] else { continue };
                     if held.iter().any(|h| h.keycode == keycode) {
                         continue;
                     }
@@ -289,10 +327,10 @@ fn main() {
                         eprintln!("mediakeyd: {}", bindings[i].name);
                     }
                     fire(&mut bindings[i]);
-                    let delay = match bindings[i].repeat {
-                        Repeat::Once => None,
-                        Repeat::ServerDelay => Some(repeat_rate(dpy).0),
-                        Repeat::After(delay) => Some(delay),
+                    let delay = match bindings[i].mode {
+                        Mode::Repeat(None) => Some(repeat_rate(dpy).0),
+                        Mode::Repeat(Some(delay)) => Some(delay),
+                        Mode::Once | Mode::Release => None,
                     };
                     if let Some(delay) = delay {
                         held.push(Held { keycode, binding: i, next: Instant::now() + delay });
@@ -303,13 +341,23 @@ fn main() {
         }
 
         reap(&mut bindings);
+        waiting.retain(|&(r, p)| {
+            if p.is_some_and(|p| busy(&bindings[p])) {
+                return true;
+            }
+            fire(&mut bindings[r]);
+            false
+        });
 
         let now = Instant::now();
         if held.iter().any(|h| h.next <= now) {
             // A release can be missed (VT switch, server reset), so check
             // that the key is really still down before repeating it.
-            let keys = keys_down(dpy);
-            held.retain(|h| is_down(&keys, h.keycode));
+            let down = keys_down(dpy);
+            for h in held.iter().filter(|h| !is_down(&down, h.keycode)) {
+                release(&keys, &mut bindings, &mut waiting, h.keycode);
+            }
+            held.retain(|h| is_down(&down, h.keycode));
             let (_, interval) = repeat_rate(dpy);
             for h in held.iter_mut().filter(|h| h.next <= now) {
                 fire(&mut bindings[h.binding]);
@@ -325,6 +373,8 @@ fn main() {
 
         let now = Instant::now();
         let mut wait = held.iter().map(|h| h.next.saturating_duration_since(now)).min();
+        // `waiting` is only ever non-empty while a command runs, which the
+        // poll below covers.
         if bindings.iter().any(|b| b.child.is_some()) {
             wait = Some(wait.map_or(CHILD_POLL, |w| w.min(CHILD_POLL)));
         }
@@ -340,9 +390,10 @@ mod tests {
 
     #[test]
     fn modes() {
-        assert_eq!(parse_mode("once"), Some(Repeat::Once));
-        assert_eq!(parse_mode("repeat"), Some(Repeat::ServerDelay));
-        assert_eq!(parse_mode("repeat=300"), Some(Repeat::After(Duration::from_millis(300))));
+        assert_eq!(parse_mode("once"), Some(Mode::Once));
+        assert_eq!(parse_mode("repeat"), Some(Mode::Repeat(None)));
+        assert_eq!(parse_mode("repeat=300"), Some(Mode::Repeat(Some(Duration::from_millis(300)))));
+        assert_eq!(parse_mode("release"), Some(Mode::Release));
         for bad in ["repeat=", "repeat=0", "repeat=x", "repeat=20000", "repeat=-5", "Repeat", "repeat =300"] {
             assert_eq!(parse_mode(bad), None, "{bad}");
         }

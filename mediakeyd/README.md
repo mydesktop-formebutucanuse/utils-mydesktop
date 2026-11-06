@@ -18,6 +18,10 @@ receives the key as usual.
   so mediakeyd does it itself. `repeat=MS` waits MS milliseconds instead of
   the server's delay before the first repeat, for keys whose command should
   run on smoothly when held.
+- Keys marked `release` run their command when they are let go. A key can
+  have one press binding (`once`, `repeat`) and one `release` binding; the
+  release command runs after the press command has finished, so it always
+  comes last.
 - A key's command never runs twice at the same time. Presses that arrive
   while it runs are merged into one more run, so slow commands such as
   backlight changes do not pile up.
@@ -50,7 +54,7 @@ install -D -m 644 mediakeyd/config.example ~/.config/mediakeyd/config
 file given with `-c`. One binding per line:
 
 ```
-KEYSYM  repeat|repeat=MS|once  COMMAND
+KEYSYM  once|repeat|repeat=MS|release  COMMAND
 ```
 
 `COMMAND` runs with `/bin/sh -c`. Lines starting with `#` are comments.

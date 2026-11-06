@@ -50,8 +50,11 @@ takes about 60 a second.
   measured in ratios of (brightness + 3 % of the maximum): ratios because
   that is what the eye sees, the 3 % because in the dark the eye needs
   bigger steps and the panel shows nothing below 2 nits, so pure ratios
-  would crawl there for minutes. Its length follows its size: about 0.6 s
-  for a small change, 7.4 s for 140 to 315 nits, 12 s for 25 % to 100 %;
+  would crawl there for minutes. Its length follows its size, up to 8 s:
+  about 0.6 s for a small change, 7.4 s for 140 to 315 nits; a change that
+  would take longer at that speed (25 % to 100 % would take 12 s, the
+  lowest setting to 25 % 20 s) goes faster, up to 0.8 % per write, and
+  takes 8 s;
   from below 2 nits it starts at 2 nits, which looks the same, so it
   rises from the first moment. A new target during a change keeps the
   speed it has; one in the other direction slows down first, and nothing
@@ -60,14 +63,18 @@ takes about 60 a second.
   move in 1-nit steps. The keyboard moves much faster (off to
   75 % in about 2 s): nobody watches it fade.
 - **Brightness keys.** The [backlight](../backlight) command sends SIGUSR1
-  (brighter) or SIGUSR2 (dimmer). Each press moves the screen 1/16 of the
-  way between 2 nits and the maximum in the same ratio space as
-  transitions, so every press looks the same size, and the screen glides
-  there in about 0.65 s, easing in and out: about 39 writes of at most
-  0.7 % with the kernel patches, 13 of at most 2 % without. Held down (key repeat), it moves steadily and sweeps the whole range
-  in about 8 s; presses never run more than two steps ahead, so it stops
-  within a second of letting go. Like any manual change, the light is then
-  left alone until it changes a lot.
+  (brighter) or SIGUSR2 (dimmer) for a press or repeat, and SIGRTMIN when
+  the key is let go ([mediakeyd](../mediakeyd)'s `release` binding). A tap
+  moves the screen 1/16 of the way between 2 nits and the maximum in the
+  same ratio space as transitions, so every tap looks the same size,
+  gliding there in about 0.12 s (7 writes). Held down, the screen moves on
+  at that speed, 2.08 ln units a second (the whole range in about 1.6 s),
+  until the key is let go, and then stops at once: measured with XTest key
+  events on the M1 Pro, the last write came 32 ms after the release, and
+  the speed did not dip while the key was held. Letting go before the first
+  step is done still finishes it. If no release comes (a binding without
+  `release`), a key that sends no repeat for 0.4 s counts as let go. Like
+  any manual change, the light is then left alone until it changes a lot.
 - **Manual changes.** Anything that writes the brightness file (a key bound
   to `brightnessctl`, the [backlight](../backlight) script, logind) is
   noticed by comparing the file with the last value written. That channel is
