@@ -1,16 +1,22 @@
 From: kkw537 <171009921+kkw537@users.noreply.github.com>
-Subject: [PATCH] drm/apple: count the panel backlight in 1/16 nit
+Subject: [PATCH] drm/apple: count the panel backlight in 1/64 nit
 
 The backlight device counted whole nits, and a 1-nit step is clearly
 visible at low brightness (20 % at 5 nits, 0.8 % at 125). The nit-to-DAC
-tables are interpolated linearly anyway, so count in 1/16 nit instead:
-max_brightness becomes 16 times larger, whole nits give exactly the same
-DAC values as before, and the 15 values between two nits fall on the
-same lines. Checked for every value from 0 to 8144: whole nits match the
-old DAC bit for bit and the DAC never decreases.
+tables are interpolated linearly anyway, so count in 1/64 nit instead:
+max_brightness becomes 64 times larger (32000 on a 500-nit panel), whole
+nits give exactly the same DAC values as before, and the 63 values
+between two nits fall on the same lines. Checked for every value from 0
+to 32576 (509 nits): whole nits match the old DAC bit for bit, and the
+DAC rises with every step from 2 nits up.
+
+As fine as 1/64 because the brightness can change up to 60 times a
+second (see the next patch): a slow change then moves well under 1/16
+nit per update at low brightness, and would advance in uneven jumps of
+1/16 nit (3 % at 2 nits).
 
 Tools that scale by max_brightness (logind, brightnessctl, desktop
-sliders) keep working; anything that wrote raw nits now gets 1/16 of
+sliders) keep working; anything that wrote raw nits now gets 1/64 of
 them.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -26,7 +32,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 + * brightness). The DAC tables are interpolated linearly in any case; whole
 + * nits give exactly the same DAC values as before.
 + */
-+#define BL_SUBSTEPS		16U
++#define BL_SUBSTEPS		64U
 +
 +/*
   * lookup for display brightness 2 to 99 nits
