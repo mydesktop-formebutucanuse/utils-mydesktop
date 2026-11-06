@@ -1,0 +1,76 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] drm/apple: apply the panel brightness without blocking the
+ writer
+
+A write to the panel backlight slept 42 ms (one frame at 23.976 Hz, in
+the hope that a swap carries the new brightness meanwhile) and then ran a
+display commit, all within the write and under the backlight lock. A
+write took 43 to 47 ms on an M1 Pro, so the brightness could change at
+most about 21 times a second, and a gradual change showed as steps.
+
+Hand the update to the bl_update_wq work item, which the driver already
+uses when the DCP asks for one, and wait one frame at 120 Hz (8.4 ms)
+instead of 42 ms:
+
+ - The writer returns at once. Writes that come faster than the display
+   takes them are merged, and the latest value is shown.
+ - While something is being drawn, the next swap carries the brightness
+   within that frame and the work item finds nothing left to commit, as
+   before. On a still screen it commits by itself, about 60 times a
+   second.
+
+On suspend the update is still finished before update_status() returns,
+so it stays ordered before the display's own suspend. The writer no
+longer sees errors from the commit; the work item ignored them already.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/apple/dcp_backlight.c
++++ b/drivers/gpu/drm/apple/dcp_backlight.c
+@@ -194,6 +194,14 @@
+ 	return ret;
+ }
+ 
++/*
++ * One frame of the panel at 120 Hz. A display update in that time carries
++ * the new brightness with it (see the swap request), and then no commit of
++ * our own is needed. At a lower refresh rate it only means more commits of
++ * our own, and those wait for the display anyway.
++ */
++#define BL_UPDATE_WAIT_US	8400
++
+ int dcp_backlight_update(struct apple_dcp *dcp)
+ {
+ 	/*
+@@ -205,9 +213,9 @@
+ 	if (!dcp->valid_mode)
+ 		return 0;
+ 
+-	/* Wait 1 vblank cycle in the hope an atomic swap has already updated
+-	 * the brightness */
+-	msleep((1001 + 23) / 24); // 42ms for 23.976 fps
++	/* Wait 1 frame in the hope an atomic swap has already updated the
++	 * brightness */
++	usleep_range(BL_UPDATE_WAIT_US, BL_UPDATE_WAIT_US + 500);
+ 
+ 	return drm_crtc_set_brightness(dcp);
+ }
+@@ -227,7 +235,17 @@
+ 
+ 	drm_modeset_unlock(&dcp->crtc->base.mutex);
+ 
+-	return dcp_backlight_update(dcp);
++	/*
++	 * Apply it from the work item instead of waiting for it here: the
++	 * writer returns at once, and writes that come faster than the display
++	 * takes them are merged, the latest value winning. On suspend it is
++	 * finished first, before the display itself suspends.
++	 */
++	schedule_work(&dcp->bl_update_wq);
++	if (bd->props.state & BL_CORE_SUSPENDED)
++		flush_work(&dcp->bl_update_wq);
++
++	return 0;
+ }
+ 
+ static const struct backlight_ops dcp_backlight_ops = {

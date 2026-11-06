@@ -4,7 +4,7 @@
 //! ambient light sensor and steps aside when someone else changes them.
 //!
 //! It wakes 5 times a second while nothing changes (the sensor reports every
-//! 200 ms), and only while a change runs, when it reaches a new value. Manual
+//! 200 ms), and about 21 times a second while a change runs. Manual
 //! screen changes are noticed through sysfs_notify() on actual_brightness,
 //! and plugging or unplugging the charger through kernel uevents.
 
@@ -25,7 +25,7 @@ use logic::{Channel, LuxFilter, Settings, Update};
 use std::path::Path;
 use std::process::exit;
 use std::time::{Duration, Instant};
-use sys::{Attr, Uevents};
+use sys::{Attr, KeySignals, Uevents};
 
 const ALS_NAME: &str = "aop-sensors-als";
 const SCREEN_DIR: &str = "/sys/class/backlight/apple-panel-bl";
@@ -64,6 +64,8 @@ struct Daemon {
     kbd: Option<Backlight>,
     battery: Option<Attr>,
     uevents: Option<Uevents>,
+    /// Brightness keys, as SIGUSR1 (brighter) and SIGUSR2 (dimmer).
+    keys: Option<KeySignals>,
     /// When to read the battery status next, if at all.
     power_check: Option<Instant>,
     dpms: Option<Attr>,
@@ -98,7 +100,7 @@ fn max_brightness(dir: &str) -> Result<u32, String> {
 }
 
 impl Daemon {
-    fn open(verbose: bool, dry_run: bool) -> Result<Daemon, String> {
+    fn open(verbose: bool, dry_run: bool, keys: Option<KeySignals>) -> Result<Daemon, String> {
         let write = !dry_run;
         let als_dir = sys::find_iio(ALS_NAME).ok_or_else(|| {
             format!(
@@ -109,10 +111,13 @@ impl Daemon {
         let als = Attr::open(als_dir.join("in_illuminance_input"), false)
             .map_err(|e| format!("{}: {e}", als_dir.display()))?;
 
+        let screen_max = max_brightness(SCREEN_DIR)?;
         let screen_settings = Settings {
             curve: logic::SCREEN_CURVE,
             floor_pct: logic::SCREEN_FLOOR_PCT,
-            max: max_brightness(SCREEN_DIR)?,
+            motion: logic::SCREEN_MOTION,
+            max: screen_max,
+            dead_zone: (screen_max as f32 * logic::SCREEN_DEAD_PCT / 100.0) as u32,
         };
         let screen = open_backlight("screen", SCREEN_DIR, screen_settings, write)?;
         let screen_notify = Attr::open(Path::new(SCREEN_DIR).join("actual_brightness"), false).ok();
@@ -123,7 +128,13 @@ impl Daemon {
 
         let kbd = match max_brightness(KBD_DIR) {
             Ok(max) => {
-                let settings = Settings { curve: logic::KBD_CURVE, floor_pct: logic::KBD_FLOOR_PCT, max };
+                let settings = Settings {
+                    curve: logic::KBD_CURVE,
+                    floor_pct: logic::KBD_FLOOR_PCT,
+                    max,
+                    motion: logic::KBD_MOTION,
+                    dead_zone: 0,
+                };
                 Some(open_backlight("kbd", KBD_DIR, settings, write)?)
             }
             Err(_) => None,
@@ -140,6 +151,7 @@ impl Daemon {
             power_check: battery.as_ref().map(|_| Instant::now()),
             battery,
             uevents,
+            keys,
             dpms,
             verbose,
             dry_run,
@@ -307,9 +319,10 @@ impl Daemon {
             match b.attr.write_u32(value) {
                 Ok(()) => {
                     b.channel.wrote(value);
-                    // Each write holds the backlight lock for about 45 ms. A
-                    // key press that waited for it may already have replaced
-                    // our value; if so, that is a manual change.
+                    // Without the kernel patches each write holds the
+                    // backlight lock for about 45 ms, and a write by someone
+                    // else that waited for it may already have replaced our
+                    // value; if so, that is a manual change.
                     let stored = b.attr.read_u32().unwrap_or(value);
                     b.channel.not_before(Instant::now() + logic::WRITE_GAP);
                     if verbose {
@@ -348,13 +361,21 @@ impl Daemon {
             }
             let notify = self.screen_notify.as_ref().map(Attr::fd);
             let uevent = self.uevents.as_ref().map(Uevents::fd);
-            let ready = match sys::wait(notify, uevent, deadline.saturating_duration_since(now)) {
+            let keys = self.keys.as_ref().map(KeySignals::fd);
+            let ready = match sys::wait(notify, uevent, keys, deadline.saturating_duration_since(now)) {
                 Ok(r) => r,
                 Err(e) => {
                     say!("autobrightd: poll: {e}");
                     exit(1);
                 }
             };
+            if ready.keys {
+                let presses = self.keys.as_ref().map_or(0, KeySignals::drain);
+                if presses != 0 {
+                    let to = self.screen.channel.key_step(presses, self.lux, Instant::now());
+                    self.log(format_args!("brightness key {presses:+}: screen -> {to}"));
+                }
+            }
             if ready.notify {
                 // Re-arm, then see whether it was us.
                 if let Some(n) = &self.screen_notify {
@@ -412,7 +433,16 @@ fn main() {
             }
         }
     }
-    match Daemon::open(verbose, dry_run) {
+    // Before anything else: until the handlers are in, a key press (a
+    // SIGUSR1 or SIGUSR2) would end the process.
+    let keys = match KeySignals::install() {
+        Ok(k) => Some(k),
+        Err(e) => {
+            say!("autobrightd: brightness keys: {e}");
+            None
+        }
+    };
+    match Daemon::open(verbose, dry_run, keys) {
         Ok(mut d) => d.run(),
         Err(e) => {
             say!("autobrightd: {e}");

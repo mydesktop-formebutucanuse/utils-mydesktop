@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! sysfs files kept open for the life of the daemon, kernel uevents, and
-//! poll().
+//! sysfs files kept open for the life of the daemon, kernel uevents,
+//! brightness-key signals, and poll().
 
 use std::ffi::{c_int, c_short, c_ulong, c_void};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -101,12 +102,83 @@ const SOCK_NONBLOCK: c_int = 0o4000;
 const SOCK_CLOEXEC: c_int = 0o2000000;
 const NETLINK_KOBJECT_UEVENT: c_int = 15;
 const ENOBUFS: i32 = 105;
+const SIGUSR1: c_int = 10;
+const SIGUSR2: c_int = 12;
+const O_NONBLOCK: c_int = 0o4000;
+const O_CLOEXEC: c_int = 0o2000000;
 
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
     fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
     fn bind(fd: c_int, addr: *const SockaddrNl, len: u32) -> c_int;
     fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
+    fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+    fn signal(signum: c_int, handler: usize) -> usize;
+    fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
+    fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
+}
+
+/// Write end of the key pipe, for the signal handler.
+static KEY_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_key_signal(sig: c_int) {
+    let byte = if sig == SIGUSR1 { b'+' } else { b'-' };
+    let fd = KEY_PIPE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: write() is async-signal-safe; one byte from a local.
+        unsafe { write(fd, (&byte as *const u8).cast(), 1) };
+    }
+}
+
+/// Brightness keys arrive as signals: SIGUSR1 for brighter, SIGUSR2 for
+/// dimmer (sent by the backlight script). The handler writes a byte into a
+/// pipe, which poll() watches, so no press is missed between two polls.
+pub struct KeySignals {
+    read: OwnedFd,
+    _write: OwnedFd,
+}
+
+impl KeySignals {
+    /// Installs the handlers. Do this first thing: the default action for
+    /// these signals ends the process.
+    pub fn install() -> io::Result<KeySignals> {
+        let mut fds = [0 as c_int; 2];
+        // SAFETY: fds has room for the two descriptors.
+        if unsafe { pipe2(fds.as_mut_ptr(), O_NONBLOCK | O_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both are new descriptors that nothing else owns.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        KEY_PIPE.store(write.as_raw_fd(), Ordering::Relaxed);
+        let handler = on_key_signal as extern "C" fn(c_int) as usize;
+        // SAFETY: glibc's signal() installs a persistent handler (BSD
+        // semantics), and the handler only calls write().
+        unsafe {
+            signal(SIGUSR1, handler);
+            signal(SIGUSR2, handler);
+        }
+        Ok(KeySignals { read, _write: write })
+    }
+
+    pub fn fd(&self) -> c_int {
+        self.read.as_raw_fd()
+    }
+
+    /// Presses since the last call: + brighter, - dimmer.
+    pub fn drain(&self) -> i32 {
+        let mut net = 0;
+        let mut buf = [0u8; 64];
+        loop {
+            // SAFETY: buf is valid for its length; the pipe is non-blocking.
+            let n = unsafe { read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                return net;
+            }
+            for &b in &buf[..n as usize] {
+                net += if b == b'+' { 1 } else { -1 };
+            }
+        }
+    }
 }
 
 /// Kernel uevents (netlink group 1), which need no privileges to read.
@@ -169,29 +241,40 @@ pub struct Ready {
     /// sysfs_notify() fired; read the attribute again to re-arm it.
     pub notify: bool,
     pub uevent: bool,
+    pub keys: bool,
 }
 
-/// Waits up to `timeout` for sysfs_notify() on `notify` (POLLPRI) or for
-/// data on the uevent socket.
-pub fn wait(notify: Option<c_int>, uevent: Option<c_int>, timeout: Duration) -> io::Result<Ready> {
+/// Waits up to `timeout` for sysfs_notify() on `notify` (POLLPRI), for data
+/// on the uevent socket, or for a brightness key.
+pub fn wait(
+    notify: Option<c_int>,
+    uevent: Option<c_int>,
+    keys: Option<c_int>,
+    timeout: Duration,
+) -> io::Result<Ready> {
     let mut fds = [
         PollFd { fd: notify.unwrap_or(-1), events: POLLPRI, revents: 0 },
         PollFd { fd: uevent.unwrap_or(-1), events: POLLIN, revents: 0 },
+        PollFd { fd: keys.unwrap_or(-1), events: POLLIN, revents: 0 },
     ];
     // Round up so we do not wake just before a deadline and spin.
     let ms = timeout.as_micros().div_ceil(1000).min(c_int::MAX as u128) as c_int;
-    // SAFETY: two valid PollFds; a negative fd is ignored by poll().
+    // SAFETY: three valid PollFds; a negative fd is ignored by poll().
     let n = unsafe { poll(fds.as_mut_ptr(), fds.len() as c_ulong, ms) };
     if n < 0 {
         let e = io::Error::last_os_error();
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e);
         }
-        fds[0].revents = 0;
-        fds[1].revents = 0;
+        // Interrupted, most likely by a key signal: look at the pipe anyway.
+        for f in &mut fds {
+            f.revents = 0;
+        }
+        fds[2].revents = POLLIN;
     }
     Ok(Ready {
         notify: fds[0].revents & POLLPRI != 0,
         uevent: fds[1].revents & (POLLIN | POLLERR) != 0,
+        keys: fds[2].revents & POLLIN != 0,
     })
 }
