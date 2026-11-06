@@ -283,7 +283,7 @@ impl Daemon {
             }
             // Someone may have changed it since our last write.
             self.check(which);
-            let (dry_run, verbose) = (self.dry_run, self.verbose);
+            let (dry_run, verbose, lux) = (self.dry_run, self.verbose, self.lux);
             let Some(b) = self.get(which) else { continue };
             let Some(value) = b.channel.frame(now) else { continue };
             if dry_run {
@@ -296,12 +296,21 @@ impl Daemon {
             let started = Instant::now();
             match b.attr.write_u32(value) {
                 Ok(()) => {
-                    // Read back: a driver may store something else.
+                    b.channel.wrote(value);
+                    // Each write holds the backlight lock for about 45 ms. A
+                    // key press that waited for it may already have replaced
+                    // our value; if so, that is a manual change.
                     let stored = b.attr.read_u32().unwrap_or(value);
-                    b.channel.wrote(stored);
+                    b.channel.not_before(Instant::now() + logic::WRITE_GAP);
                     if verbose {
                         let ms = started.elapsed().as_millis();
-                        eprintln!("autobrightd: {} {stored} ({ms} ms)", b.channel.name);
+                        eprintln!("autobrightd: {} {value} ({ms} ms)", b.channel.name);
+                    }
+                    if stored != value && b.channel.observe(stored, lux) && verbose {
+                        eprintln!(
+                            "autobrightd: {} set to {stored} by someone else, holding until the light changes",
+                            b.channel.name
+                        );
                     }
                 }
                 Err(e) => {

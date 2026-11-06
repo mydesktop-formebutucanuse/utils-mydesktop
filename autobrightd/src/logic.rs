@@ -45,6 +45,10 @@ pub const DEADBAND_PCT: u32 = 2;
 /// write makes the Apple DCP driver sleep 42 ms and run a display commit
 /// (43 to 47 ms measured), under a lock, so this is as fast as it goes.
 pub const FRAME: Duration = Duration::from_millis(45);
+/// Pause after each write before the next frame looks at the file. A write
+/// by someone else that waited for the lock gets it in that time, so the
+/// next frame sees it instead of overwriting it.
+pub const WRITE_GAP: Duration = Duration::from_millis(1);
 /// Each frame moves 1/2^SMOOTH_SHIFT of the remaining gap, and at least one
 /// unit: asahi-brightnessd's transition, fast at first and slowing down.
 pub const SMOOTH_SHIFT: u32 = 4;
@@ -238,14 +242,17 @@ impl Channel {
         (value != self.known).then_some(value)
     }
 
-    /// Records a successful write (the value read back after it). If the
-    /// driver kept the old value, the change is given up rather than retried
-    /// forever.
+    /// Records a successful write of `value`. Read the file back afterwards
+    /// and pass that to observe(): a write by someone else that was waiting
+    /// for the lock can land between the two.
     pub fn wrote(&mut self, value: u32) {
-        let stuck = value == self.known;
         self.known = value;
-        if stuck {
-            self.stop();
+    }
+
+    /// Delays the next frame until at least `t`.
+    pub fn not_before(&mut self, t: Instant) {
+        if let Some(ramp) = &mut self.ramp {
+            ramp.next_at = ramp.next_at.max(t);
         }
     }
 
@@ -370,14 +377,31 @@ mod tests {
     }
 
     #[test]
-    fn a_value_the_driver_refuses_ends_the_change() {
+    fn a_write_landing_after_ours_is_a_manual_change() {
+        // Seen on the M1 Pro: we write 225, a key press that waited for the
+        // lock writes 200, and our read-back finds 200.
         let t = Instant::now();
-        let mut ch = screen(200);
-        ch.update(1000.0, 0.0, t);
-        assert!(ch.frame(t).is_some());
-        ch.wrote(200);
+        let mut ch = screen(220);
+        ch.ramp = Some(Ramp::new(304, t));
+        assert_eq!(ch.frame(t), Some(225));
+        ch.wrote(225);
+        assert!(ch.observe(200, 9.0));
         assert!(ch.ramp.is_none());
-        assert_eq!(ch.target, 200);
+        assert_eq!((ch.known, ch.target), (200, 200));
+        assert_eq!(ch.update(9.0, 30.0, t), Update::Nothing);
+    }
+
+    #[test]
+    fn the_gap_after_a_write_delays_the_next_frame() {
+        let t = Instant::now();
+        let mut ch = screen(300);
+        ch.ramp = Some(Ramp::new(150, t));
+        ch.frame(t);
+        let late = t + FRAME + WRITE_GAP;
+        ch.not_before(late);
+        assert_eq!(ch.next_frame(), Some(late));
+        ch.not_before(t);
+        assert_eq!(ch.next_frame(), Some(late));
     }
 
     #[test]

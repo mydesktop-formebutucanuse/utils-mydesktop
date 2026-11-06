@@ -48,7 +48,10 @@ to back at that rate.
   then left alone until the light shifts by 75 % and at least 5 lux; then it
   ramps from your value to the automatic one. The screen is watched through
   the kernel's change notification; the keyboard (LED class, which has none)
-  is checked with every sample.
+  is checked with every sample. During a transition a key press usually
+  waits for the backlight lock and lands right after one of our writes, so
+  each write is read back (a different value means a manual change) and the
+  next frame waits 1 ms, by which time a waiting write is in place.
 - **Power source.** The AC boost needs to know whether the charger is
   connected. `macsmc-ac/online` cannot tell on an M1 Pro: it drops to 0 for
   about 0.4 s when the cable goes in or out and reads 1 otherwise, so a
