@@ -5,7 +5,8 @@
 //!
 //! It wakes 5 times a second while nothing changes (the sensor reports every
 //! 200 ms), and 20 times a second only while a change is running. Manual
-//! screen changes are noticed through sysfs_notify() on actual_brightness.
+//! screen changes are noticed through sysfs_notify() on actual_brightness,
+//! and plugging or unplugging the charger through kernel uevents.
 
 mod logic;
 mod sys;
@@ -14,17 +15,25 @@ use logic::{Channel, LuxFilter, Settings, Update};
 use std::path::Path;
 use std::process::exit;
 use std::time::{Duration, Instant};
-use sys::Attr;
+use sys::{Attr, Uevents};
 
 const ALS_NAME: &str = "aop-sensors-als";
 const SCREEN_DIR: &str = "/sys/class/backlight/apple-panel-bl";
 const KBD_DIR: &str = "/sys/class/leds/kbd_backlight";
-const AC_ONLINE: &str = "/sys/class/power_supply/macsmc-ac/online";
+/// Whether the charger is connected. macsmc-ac/online cannot tell: on an
+/// M1 Pro it drops to 0 for about 0.4 s when the cable goes in or out and
+/// reads 1 otherwise. The battery status is right, but each read costs about
+/// 0.8 ms of SMC traffic, so it is read only when the SMC driver sends a
+/// power_supply uevent (on every plug or unplug).
+const BATTERY_STATUS: &str = "/sys/class/power_supply/macsmc-battery/status";
+const POWER_SUPPLY_PREFIX: &str = "macsmc-";
+/// The status is read again this long after an event, in case it lagged.
+const POWER_RECHECK: Duration = Duration::from_millis(1500);
+/// Without uevents, the status is polled this often instead.
+const POWER_POLL: Duration = Duration::from_secs(5);
 
 /// The sensor reports every 200 ms; reading it more often finds the same value.
 const SAMPLE: Duration = Duration::from_millis(200);
-/// AC state is read every this many samples (once a second).
-const AC_EVERY: u32 = 5;
 /// While the panel is off, only DPMS is checked, this often.
 const DPMS_OFF_CHECK: Duration = Duration::from_secs(1);
 
@@ -43,7 +52,10 @@ struct Daemon {
     /// actual_brightness of the screen, only for its change notification.
     screen_notify: Option<Attr>,
     kbd: Option<Backlight>,
-    ac: Option<Attr>,
+    battery: Option<Attr>,
+    uevents: Option<Uevents>,
+    /// When to read the battery status next, if at all.
+    power_check: Option<Instant>,
     dpms: Option<Attr>,
     verbose: bool,
     dry_run: bool,
@@ -51,7 +63,6 @@ struct Daemon {
     lux: f32,
     on_ac: bool,
     panel_off: bool,
-    samples: u32,
 }
 
 fn open_backlight(name: &'static str, dir: &str, settings: Settings, write: bool) -> Result<Backlight, String> {
@@ -107,7 +118,8 @@ impl Daemon {
             }
             Err(_) => None,
         };
-        let ac = Attr::open(AC_ONLINE, false).ok();
+        let battery = Attr::open(BATTERY_STATUS, false).ok();
+        let uevents = battery.as_ref().and_then(|_| Uevents::open().ok());
         let dpms = sys::find_edp_dpms().and_then(|p| Attr::open(p, false).ok());
 
         let d = Daemon {
@@ -115,7 +127,9 @@ impl Daemon {
             screen,
             screen_notify,
             kbd,
-            ac,
+            power_check: battery.as_ref().map(|_| Instant::now()),
+            battery,
+            uevents,
             dpms,
             verbose,
             dry_run,
@@ -123,7 +137,6 @@ impl Daemon {
             lux: 0.0,
             on_ac: false,
             panel_off: false,
-            samples: 0,
         };
         if verbose {
             let path = |a: &Option<Attr>| a.as_ref().map_or("(none)".into(), |a| a.path.display().to_string());
@@ -133,7 +146,9 @@ impl Daemon {
                 Some(k) => eprintln!("autobrightd: kbd {} max {}", k.attr.path.display(), k.channel.settings.max),
                 None => eprintln!("autobrightd: kbd (none)"),
             }
-            eprintln!("autobrightd: ac {}, dpms {}, notify {}", path(&d.ac), path(&d.dpms), path(&d.screen_notify));
+            let how = if d.uevents.is_some() { "on uevents" } else { "polled" };
+            eprintln!("autobrightd: power {} ({how})", path(&d.battery));
+            eprintln!("autobrightd: dpms {}, notify {}", path(&d.dpms), path(&d.screen_notify));
             if dry_run {
                 eprintln!("autobrightd: dry run, nothing is written");
             }
@@ -174,19 +189,27 @@ impl Daemon {
         }
     }
 
-    /// One sensor sample: AC, DPMS, lux, keyboard check, new targets.
-    fn sample(&mut self, now: Instant) {
-        if self.samples.is_multiple_of(AC_EVERY)
-            && let Some(ac) = &self.ac
-        {
-            let on = ac.read_int().is_ok_and(|v| v == 1);
-            if on != self.on_ac {
-                self.on_ac = on;
-                self.log(format_args!("{}", if on { "on AC" } else { "on battery" }));
+    /// Reads the battery status: anything but Discharging means the charger
+    /// is connected. The next sample applies the new AC boost.
+    fn check_power(&mut self) {
+        let Some(battery) = &self.battery else { return };
+        let mut buf = [0; 32];
+        let status = match battery.read_str(&mut buf) {
+            Ok(s) => s.to_owned(),
+            Err(e) => {
+                self.log(format_args!("reading {}: {e}", battery.path.display()));
+                return;
             }
+        };
+        let on = status != "Discharging";
+        if on != self.on_ac {
+            self.on_ac = on;
+            self.log(format_args!("{} (battery {status})", if on { "on AC" } else { "on battery" }));
         }
-        self.samples = self.samples.wrapping_add(1);
+    }
 
+    /// One sensor sample: DPMS, lux, keyboard check, new targets.
+    fn sample(&mut self, now: Instant) {
         let off = self.dpms.as_ref().is_some_and(|d| {
             let mut buf = [0; 32];
             d.read_str(&mut buf).is_ok_and(|s| s != "On")
@@ -302,23 +325,35 @@ impl Daemon {
                     }
                 }
             }
-            let fd = self.screen_notify.as_ref().map(Attr::fd);
-            match sys::wait_notify(fd, deadline.saturating_duration_since(now)) {
-                Ok(true) => {
-                    // Re-arm, then see whether it was us.
-                    if let Some(n) = &self.screen_notify {
-                        let _ = n.read_int();
-                    }
-                    self.check(Which::Screen);
-                }
-                Ok(false) => {}
+            if let Some(t) = self.power_check {
+                deadline = deadline.min(t);
+            }
+            let notify = self.screen_notify.as_ref().map(Attr::fd);
+            let uevent = self.uevents.as_ref().map(Uevents::fd);
+            let ready = match sys::wait(notify, uevent, deadline.saturating_duration_since(now)) {
+                Ok(r) => r,
                 Err(e) => {
                     eprintln!("autobrightd: poll: {e}");
                     exit(1);
                 }
+            };
+            if ready.notify {
+                // Re-arm, then see whether it was us.
+                if let Some(n) = &self.screen_notify {
+                    let _ = n.read_int();
+                }
+                self.check(Which::Screen);
             }
 
             let now = Instant::now();
+            if ready.uevent && self.uevents.as_mut().is_some_and(|u| u.drain(POWER_SUPPLY_PREFIX)) {
+                self.check_power();
+                self.power_check = Some(now + POWER_RECHECK);
+            }
+            if self.power_check.is_some_and(|t| t <= now) {
+                self.check_power();
+                self.power_check = if self.uevents.is_some() { None } else { Some(now + POWER_POLL) };
+            }
             if now >= next_sample {
                 self.sample(now);
                 next_sample = if self.panel_off {

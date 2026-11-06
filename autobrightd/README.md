@@ -11,10 +11,11 @@ writes much less often:
 
 | | asahi-brightnessd | autobrightd |
 |---|---|---|
-| Wakeups while idle | 30 per second | 6 per second (5 sensor samples, 1 AC read) |
+| Wakeups while idle | 30 per second | 5 per second (sensor samples only) |
 | sysfs files opened while idle | about 120 per second | none (kept open, read with `pread`) |
 | Noticing a manual screen change | next 33 ms tick | at once (`POLLPRI` on `actual_brightness`) |
 | Noticing a manual keyboard change | next 33 ms tick | next sample, at most 200 ms |
+| Noticing the charger | `macsmc-ac/online` once a second, which misses it on an M1 Pro | at once (uevent), from the battery status |
 | Writes for lux noise (e.g. 235 ↔ 240 lux) | a few each time | none (2 % dead band) |
 | Writes for a full 25 % → 100 % change | 73, about 5.6 s | 20, about 1 s |
 | Runs as | root | your user (udev rule below) |
@@ -45,6 +46,14 @@ about 77 ms, not 33.
   ramps from your value to the automatic one. The screen is watched through
   the kernel's change notification; the keyboard (LED class, which has none)
   is checked with every sample.
+- **Power source.** The AC boost needs to know whether the charger is
+  connected. `macsmc-ac/online` cannot tell on an M1 Pro: it drops to 0 for
+  about 0.4 s when the cable goes in or out and reads 1 otherwise, so a
+  daemon polling it dims for a second and brightens again. The battery
+  status is right (`Discharging` without the charger) but costs about
+  0.8 ms of SMC traffic per read, so it is read only when the SMC driver
+  sends a `power_supply` uevent, which it does on every plug and unplug,
+  and once more 1.5 s later.
 - **Panel off.** When the internal panel's DPMS is not `On`, the keyboard is
   switched off, ramps stop, and only DPMS is checked, once a second.
 

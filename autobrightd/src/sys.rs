@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! sysfs files kept open for the life of the daemon, and poll().
+//! sysfs files kept open for the life of the daemon, kernel uevents, and
+//! poll().
 
-use std::ffi::{c_int, c_short, c_ulong};
+use std::ffi::{c_int, c_short, c_ulong, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,26 +84,114 @@ struct PollFd {
     revents: c_short,
 }
 
+#[repr(C)]
+struct SockaddrNl {
+    family: u16,
+    pad: u16,
+    pid: u32,
+    groups: u32,
+}
+
+const POLLIN: c_short = 0x1;
 const POLLPRI: c_short = 0x2;
+const POLLERR: c_short = 0x8;
+const AF_NETLINK: c_int = 16;
+const SOCK_DGRAM: c_int = 2;
+const SOCK_NONBLOCK: c_int = 0o4000;
+const SOCK_CLOEXEC: c_int = 0o2000000;
+const NETLINK_KOBJECT_UEVENT: c_int = 15;
+const ENOBUFS: i32 = 105;
 
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+    fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
+    fn bind(fd: c_int, addr: *const SockaddrNl, len: u32) -> c_int;
+    fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
 }
 
-/// Waits up to `timeout` for sysfs_notify() on `fd` (POLLPRI). Returns
-/// true if it fired. The caller must read the attribute again to re-arm it.
-pub fn wait_notify(fd: Option<c_int>, timeout: Duration) -> io::Result<bool> {
-    let mut pfd = PollFd { fd: fd.unwrap_or(-1), events: POLLPRI, revents: 0 };
+/// Kernel uevents (netlink group 1), which need no privileges to read.
+pub struct Uevents {
+    fd: OwnedFd,
+    buf: Box<[u8]>,
+}
+
+impl Uevents {
+    pub fn open() -> io::Result<Uevents> {
+        let ty = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+        // SAFETY: plain system call; the descriptor is owned at once.
+        let raw = unsafe { socket(AF_NETLINK, ty, NETLINK_KOBJECT_UEVENT) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: raw is a new descriptor that nothing else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let addr = SockaddrNl { family: AF_NETLINK as u16, pad: 0, pid: 0, groups: 1 };
+        let len = size_of::<SockaddrNl>() as u32;
+        // SAFETY: addr is a valid sockaddr_nl of the given length.
+        if unsafe { bind(fd.as_raw_fd(), &addr, len) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Uevents { fd, buf: vec![0; 8192].into_boxed_slice() })
+    }
+
+    pub fn fd(&self) -> c_int {
+        self.fd.as_raw_fd()
+    }
+
+    /// Reads every queued event. Returns true if one was about a power
+    /// supply whose name starts with `prefix`, or if events were lost.
+    pub fn drain(&mut self, prefix: &str) -> bool {
+        let mut hit = false;
+        loop {
+            let (ptr, len) = (self.buf.as_mut_ptr().cast(), self.buf.len());
+            // SAFETY: buf is valid for len bytes; the socket is non-blocking.
+            let n = unsafe { recv(self.fd.as_raw_fd(), ptr, len, 0) };
+            if n < 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(ENOBUFS) {
+                    hit = true;
+                    continue;
+                }
+                return hit; // EAGAIN: nothing left
+            }
+            let (mut power, mut named) = (false, false);
+            for field in self.buf[..n as usize].split(|&b| b == 0) {
+                power |= field == b"SUBSYSTEM=power_supply";
+                if let Some(name) = field.strip_prefix(b"POWER_SUPPLY_NAME=") {
+                    named = name.starts_with(prefix.as_bytes());
+                }
+            }
+            hit |= power && named;
+        }
+    }
+}
+
+pub struct Ready {
+    /// sysfs_notify() fired; read the attribute again to re-arm it.
+    pub notify: bool,
+    pub uevent: bool,
+}
+
+/// Waits up to `timeout` for sysfs_notify() on `notify` (POLLPRI) or for
+/// data on the uevent socket.
+pub fn wait(notify: Option<c_int>, uevent: Option<c_int>, timeout: Duration) -> io::Result<Ready> {
+    let mut fds = [
+        PollFd { fd: notify.unwrap_or(-1), events: POLLPRI, revents: 0 },
+        PollFd { fd: uevent.unwrap_or(-1), events: POLLIN, revents: 0 },
+    ];
     // Round up so we do not wake just before a deadline and spin.
     let ms = timeout.as_micros().div_ceil(1000).min(c_int::MAX as u128) as c_int;
-    // SAFETY: one valid PollFd; a negative fd is ignored by poll().
-    let n = unsafe { poll(&mut pfd, 1, ms) };
-    match n {
-        -1 => {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) }
+    // SAFETY: two valid PollFds; a negative fd is ignored by poll().
+    let n = unsafe { poll(fds.as_mut_ptr(), fds.len() as c_ulong, ms) };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
         }
-        0 => Ok(false),
-        _ => Ok(pfd.revents & POLLPRI != 0),
+        fds[0].revents = 0;
+        fds[1].revents = 0;
     }
+    Ok(Ready {
+        notify: fds[0].revents & POLLPRI != 0,
+        uevent: fds[1].revents & (POLLIN | POLLERR) != 0,
+    })
 }
