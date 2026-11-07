@@ -5,8 +5,9 @@
 //! - It becomes the XSETTINGS manager of the screen, for GTK, Chromium and
 //!   Electron: Gdk/WindowScalingFactor is the whole part of the factor and
 //!   the fonts get the rest of it through Gdk/UnscaledDPI. Xft/DPI keeps the
-//!   full resolution for the other readers. GTK and Chromium follow a change
-//!   of these settings without being restarted.
+//!   full resolution for the other readers. Gtk/CursorThemeSize is the cursor
+//!   size in pixels, the same as Xcursor.size. GTK and Chromium follow a
+//!   change of these settings without being restarted.
 //! - It sets the Xft.dpi and Xcursor.size resources (RESOURCE_MANAGER), for
 //!   Qt, the applications using Xft directly and the cursor themes. The
 //!   previous lines are saved on the root window and put back on exit.
@@ -232,6 +233,12 @@ impl Scd {
                 ("Gdk/WindowScalingFactor", scale),
                 ("Gdk/UnscaledDPI", unscaled),
                 ("Xft/DPI", (dpi * 1024.0).round() as i32),
+                // In pixels, not scaled by the window scale: GTK 3 gives it
+                // to Xcursor as it is, and GNOME sets it to its cursor size
+                // times the window scale. Chromium and Electron read it before
+                // Xcursor.size, and Chromium 152 makes a missing one 24, so
+                // without it their cursors are 24 pixels at any factor.
+                ("Gtk/CursorThemeSize", cursor as i32),
             ],
         );
         self.set_property(self.win, self.settings_atom, self.settings_atom, &data);

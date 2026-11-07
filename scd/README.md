@@ -13,8 +13,12 @@ applications twice: Chromium and Electron multiply the GTK window scale by
 - It becomes the XSETTINGS manager of the screen. `Gdk/WindowScalingFactor`
   is the whole part of the factor, `Gdk/UnscaledDPI` gives the rest of it to
   the fonts, so they are not scaled twice, and `Xft/DPI` is the full
-  resolution. GTK, Chromium and Electron applications follow a change of these
-  settings while they run.
+  resolution. `Gtk/CursorThemeSize` is the cursor size in pixels (24 × factor,
+  like `Xcursor.size`): GTK 3 gives it to Xcursor without scaling it again,
+  and Chromium and Electron read it before `Xcursor.size`. Chromium 152 makes
+  a missing `Gtk/CursorThemeSize` 24, so without it their cursors stayed at
+  24 pixels whatever the factor. GTK, Chromium and Electron applications
+  follow a change of these settings while they run.
 - It sets the `Xft.dpi` (96 × factor) and `Xcursor.size` (24 × factor)
   resources, for Qt, Xft applications and the cursor themes. These are read
   when an application starts. The previous lines are saved on the root window
