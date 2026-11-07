@@ -1,0 +1,22 @@
+# ~/.config/logincookies/rules: which cookies are login cookies, ahead of
+# logincookies' own guess from the cookie names. One rule a line:
+#
+#   NAME     a cookie named NAME is a login cookie, on any site
+#            (* matches any characters, upper and lower case are the same)
+#   !NAME    a cookie named NAME never is
+#   @SITE    every cookie of SITE and of its subdomains is one
+#   !@SITE   no cookie of SITE is one
+#
+# The rules saying no come first. `logincookies list -a` while the browser
+# runs lists its cookies and marks the login cookies with *: log in, look
+# for the site's cookies there, and add the ones that are missing.
+# The rules are read when logincookies starts.
+
+# A site whose login cookies have names of their own: keep all its cookies.
+#@daum.net
+
+# One more cookie name.
+#my_login_cookie
+
+# A cookie that only looks like a login cookie.
+#!lang_session

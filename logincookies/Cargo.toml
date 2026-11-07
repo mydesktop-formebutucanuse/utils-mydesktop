@@ -1,0 +1,10 @@
+[package]
+name = "logincookies"
+version = "0.1.0"
+description = "Keep only the login cookies of LibreWolf or Firefox when the browser deletes its cookies on exit"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies: libsqlite3 is called directly (src/sqlite.rs).

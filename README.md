@@ -9,15 +9,16 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 | [backlight](backlight) | The brightness keys' command: screen steps through autobrightd, keyboard through logind |
 | [autobrightd](autobrightd) | Sets the screen and keyboard backlight from the ambient light sensor, and steps aside when you change them |
 | [scd](scd) | Gives Window Maker's GUI scale factor to GTK, Chromium, Electron and Qt applications and to the cursors, without scaling any of them twice |
+| [logincookies](logincookies) | Keeps LibreWolf's login cookies, and only those, when it deletes its cookies on exit |
 | [kernel](kernel) | Asahi kernel patches: the panel backlight in 1/64 nit and up to 60 updates a second, so brightness changes have no visible steps |
 
 ## Install on Gentoo
 
 [gentoo](gentoo) has a live ebuild, `x11-misc/utils-mydesktop-9999`, that
 builds the latest commit here and installs all the tools: `mediakeyd`,
-`autobrightd`, `scd` and `backlight` in `/usr/bin`, autobrightd's udev rule
-in `/usr/lib/udev/rules.d`, and the READMEs. The kernel patches are separate
-(see [kernel](kernel)).
+`autobrightd`, `scd`, `logincookies` and `backlight` in `/usr/bin`,
+autobrightd's udev rule in `/usr/lib/udev/rules.d`, and the READMEs. The
+kernel patches are separate (see [kernel](kernel)).
 
 ```sh
 sudo sh gentoo/install.sh          # adds it to the mydesktop overlay and emerges it
