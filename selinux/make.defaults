@@ -1,0 +1,9 @@
+# wmutils: installed as /etc/portage/make.profile/make.defaults by
+# selinux/install.sh, beside a `parent` file that names the profile the
+# system had and Gentoo's features/selinux. See selinux/README.md.
+#
+# One policy store instead of all four: mcs, Gentoo's default and the one
+# /etc/selinux/config names. The -* takes the policy ebuilds' own defaults
+# (all four) away first. POLICY_TYPES is the same for the older ebuilds.
+SELINUX_POLICY_TYPES="-* mcs"
+POLICY_TYPES="mcs"

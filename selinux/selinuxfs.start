@@ -1,0 +1,15 @@
+#!/bin/sh
+# wmutils: installed as /etc/local.d/wmutils-selinuxfs.start
+# by selinux/install.sh. s6-rc's init-local runs it at every boot.
+#
+# Mounts selinuxfs, through which the SELinux tools and libselinux talk to
+# the kernel; without it they take SELinux for off. OpenRC and systemd mount
+# it themselves; s6-rc's mount-kernelfs does not, and the initramfs unmounts
+# its own after loading the policy. The directory is there only when the
+# kernel runs with SELinux, so on any other boot this does nothing.
+# See selinux/README.md.
+
+if [ -d /sys/fs/selinux ] && ! mountpoint -q /sys/fs/selinux; then
+	mount -t selinuxfs -o nosuid,noexec selinuxfs /sys/fs/selinux
+fi
+exit 0
