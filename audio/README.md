@@ -13,9 +13,9 @@ whenever playback started or stopped.
 | File | What it is |
 |---|---|
 | [install.sh](install.sh) | Adds the desktop user to the `pipewire` group and installs the rest |
-| [pipewire.conf.d/99-utils-mydesktop-audio.conf](pipewire.conf.d/99-utils-mydesktop-audio.conf) | The PipeWire server's priorities, and the speaker DSP kept running |
-| [pipewire-pulse.conf.d/99-utils-mydesktop-audio.conf](pipewire-pulse.conf.d/99-utils-mydesktop-audio.conf) | Priorities of pipewire-pulse |
-| [wireplumber.conf.d/99-utils-mydesktop-audio.conf](wireplumber.conf.d/99-utils-mydesktop-audio.conf) | The speaker DSP with zeroramp in front |
+| [pipewire.conf.d/99-wmutils-audio.conf](pipewire.conf.d/99-wmutils-audio.conf) | The PipeWire server's priorities, and the speaker DSP kept running |
+| [pipewire-pulse.conf.d/99-wmutils-audio.conf](pipewire-pulse.conf.d/99-wmutils-audio.conf) | Priorities of pipewire-pulse |
+| [wireplumber.conf.d/99-wmutils-audio.conf](wireplumber.conf.d/99-wmutils-audio.conf) | The speaker DSP with zeroramp in front |
 | [zeroramp.py](zeroramp.py) | Writes a copy of asahi-audio's speaker DSP graph with zeroramp in front |
 | [asahi-audio.bashrc](asahi-audio.bashrc) | Portage hook that writes the copy again when asahi-audio is updated |
 
@@ -159,7 +159,7 @@ asahi-audio's graph has no zeroramp and takes no drop-ins, so:
 
 - `install.sh` writes a copy of it with a `zeroramp` in front of each of
   its two inputs, ahead of everything else in the DSP, to
-  `/usr/local/share/utils-mydesktop/audio/j314-graph.json`
+  `/usr/local/share/wmutils/audio/j314-graph.json`
   ([zeroramp.py](zeroramp.py)).
 - The WirePlumber drop-in has the speakers' DSP run from the copy. Another
   rule for the speakers would start a second DSP, so the drop-in replaces

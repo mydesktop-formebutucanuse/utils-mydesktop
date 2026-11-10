@@ -17,13 +17,17 @@
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-name=99-utils-mydesktop-audio.conf
+name=99-wmutils-audio.conf
+# The project was utils-mydesktop until November 2026: what it installed
+# under that name goes once the same is there under the new one.
+oldname=99-utils-mydesktop-audio.conf
+oldshare=/usr/local/share/utils-mydesktop/audio
 # Where the drop-ins go under /etc; here they are in the last part.
 dropins="pipewire/pipewire.conf.d pipewire/pipewire-pulse.conf.d wireplumber/wireplumber.conf.d"
 # asahi-audio's speaker DSP graph, where its copy with zeroramp goes, and
 # the Portage hook that writes the copy again when asahi-audio is updated.
 graph=/usr/share/asahi-audio/j314/graph.json
-share=/usr/local/share/utils-mydesktop/audio
+share=/usr/local/share/wmutils/audio
 hook=/etc/portage/env/media-libs/asahi-audio
 group=pipewire
 action=${1:-install}
@@ -51,9 +55,27 @@ member() {
 	id -nG "$user" | tr ' ' '\n' | grep -qx "$group"
 }
 
-# The hook file belongs to us only if it starts with our marker.
+# The hook file belongs to us only if it starts with our marker, or with
+# the one of the old name.
 ours() {
-	[ -f "$hook" ] && head -n 1 "$hook" | grep -q '^# utils-mydesktop: '
+	[ -f "$hook" ] && head -n 1 "$hook" | grep -Eq '^# (wmutils|utils-mydesktop): '
+}
+
+# Removes what was installed under the old name.
+forget_old() {
+	for d in $dropins; do
+		if [ -e "/etc/$d/$oldname" ]; then
+			rm -f "/etc/$d/$oldname"
+			echo "removed /etc/$d/$oldname (the old name)"
+		fi
+	done
+	for f in "$oldshare/j314-graph.json" "$oldshare/zeroramp.py"; do
+		if [ -e "$f" ]; then
+			rm -f "$f"
+			echo "removed $f (the old name)"
+		fi
+	done
+	rmdir "$oldshare" "${oldshare%/*}" 2>/dev/null || true
 }
 
 case "$action" in
@@ -109,6 +131,7 @@ install)
 		install -D -m 644 "$here/${d#*/}/$name" "/etc/$d/$name"
 		echo "installed /etc/$d/$name"
 	done
+	forget_old
 	if [ "$added" = yes ]; then
 		echo "Quit Window Maker and start X from a new login (or reboot): PipeWire then runs in real time."
 	else
@@ -116,6 +139,7 @@ install)
 	fi
 	;;
 remove)
+	forget_old
 	for d in $dropins; do
 		f=/etc/$d/$name
 		if [ -e "$f" ]; then

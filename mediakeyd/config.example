@@ -20,7 +20,7 @@ XF86AudioMute          once    wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 # it moves on until the key is let go ("release"), then stops at once. The
 # repeats only show autobrightd that the key is still down (if a release
 # got lost, it stops 0.4 s after the last one), so they start after 300 ms.
-# backlight is backlight/backlight of utils-mydesktop (in /usr/bin with the
+# backlight is backlight/backlight of wmutils (in /usr/bin with the
 # Gentoo package).
 XF86MonBrightnessUp    repeat=300  backlight screen +5
 XF86MonBrightnessDown  repeat=300  backlight screen -5

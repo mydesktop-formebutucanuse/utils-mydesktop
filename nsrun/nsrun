@@ -1,0 +1,193 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Run a program in Linux namespaces of its own, with a home of its own.
+#
+#   nsrun [-n] [-a] [-g] [-x] [-b PATH]... [-r PATH]... NAME COMMAND [ARG]...
+#
+# NAME is the compartment: its home is ~/.local/share/nsrun/NAME, which the
+# program sees as $HOME. It does not see the real home, /tmp, /run, the
+# session's D-Bus or the other processes, and it cannot write to /usr or
+# /etc. It does see the network and the X server.
+#
+#   -n        no network: a network namespace of its own, with nothing in it
+#   -a        sound: the PipeWire and PulseAudio sockets
+#   -g        the GPU: /dev/dri, for hardware rendering and video decoding
+#   -x        the X namespace NAME instead of the session's: the program
+#             cannot see or reach the other windows, the keyboard or the
+#             clipboard. The X server has to be started by nsrun-xserver
+#             with NAME in ~/.config/nsrun/xnamespaces.
+#   -b PATH   a file or directory of the real system, writable
+#   -r PATH   the same, read-only
+#
+# Without -x the program is an X client like any other: it can read the
+# keyboard and the other windows and type into them. See nsrun/README.md.
+set -eu
+
+usage() {
+	echo "usage: ${0##*/} [-n] [-a] [-g] [-x] [-b PATH]... [-r PATH]... NAME COMMAND [ARG]..." >&2
+	exit 2
+}
+
+die() {
+	echo "${0##*/}: $*" >&2
+	exit 1
+}
+
+nl='
+'
+net=yes
+audio=no
+gpu=no
+xns=no
+# One "b PATH" or "r PATH" a line.
+binds=
+while getopts nagxb:r: opt; do
+	case "$opt" in
+	n) net=no ;;
+	a) audio=yes ;;
+	g) gpu=yes ;;
+	x) xns=yes ;;
+	b | r)
+		path=$(realpath -e -- "$OPTARG") || exit 1
+		case "$path" in
+		*"$nl"*) die "$OPTARG: a newline in the path" ;;
+		esac
+		binds="$binds$opt $path$nl"
+		;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 2 ] || usage
+name=$1
+shift
+case "$name" in
+'' | *[!A-Za-z0-9_-]*) die "$name: a name is made of letters, digits, - and _" ;;
+esac
+
+command -v bwrap >/dev/null || die "bwrap is missing (sys-apps/bubblewrap)"
+
+uid=$(id -u)
+user=$(id -un)
+run=${XDG_RUNTIME_DIR:-/run/user/$uid}
+data=${XDG_DATA_HOME:-$HOME/.local/share}/nsrun/$name
+umask 077
+mkdir -p "$data" "$run/nsrun"
+
+# The X display, if there is a local one: its socket, and an Xauthority
+# file with one cookie. The cookie is under the "any host" family, since
+# the hostname is another one inside.
+sock=
+xauth=
+case "${DISPLAY:-}" in
+:* | unix:*)
+	dpy=${DISPLAY#*:}
+	dpy=${dpy%%.*}
+	sock=/tmp/.X11-unix/X$dpy
+	[ -S "$sock" ] || die "no X server at $sock"
+	if [ "$xns" = yes ]; then
+		xauth=$run/nsrun/x/$name.Xauthority
+		[ -f "$xauth" ] || die "there is no X namespace $name: start X with nsrun-xserver and $name in ~/.config/nsrun/xnamespaces"
+		# The namespace has a root window of its own, without the
+		# session's resources (Xft.dpi, the cursor theme and size).
+		if command -v xrdb >/dev/null; then
+			xrdb -query | XAUTHORITY=$xauth xrdb -load || true
+		fi
+	else
+		xauth=$run/nsrun/session.Xauthority
+		command -v xauth >/dev/null || die "xauth is missing (x11-apps/xauth)"
+		rm -f "$xauth.$$"
+		xauth nlist "$DISPLAY" 2>/dev/null | sed 's/^..../ffff/' |
+			xauth -q -f "$xauth.$$" nmerge - 2>/dev/null
+		if [ -s "$xauth.$$" ]; then
+			mv -f "$xauth.$$" "$xauth"
+		else
+			# No cookie for this display: the server lets local
+			# clients in without one.
+			rm -f "$xauth.$$"
+			xauth=
+		fi
+	fi
+	;;
+'') [ "$xns" = no ] || die "-x needs an X display" ;;
+*) die "$DISPLAY is not a local X display" ;;
+esac
+
+# bwrap's options are added after the command, which then goes to the end.
+n=$#
+set -- "$@" \
+	--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup \
+	--hostname "$name" --die-with-parent --new-session \
+	--clearenv \
+	--setenv HOME "$HOME" --setenv USER "$user" --setenv LOGNAME "$user" \
+	--setenv PATH /usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin \
+	--setenv XDG_RUNTIME_DIR "$run" \
+	--proc /proc --dev /dev \
+	--tmpfs /tmp --tmpfs /var/tmp --tmpfs /run --perms 0700 --dir "$run" \
+	--ro-bind /usr /usr --ro-bind /etc /etc \
+	--ro-bind-try /opt /opt --ro-bind-try /var/cache/fontconfig /var/cache/fontconfig \
+	--bind "$data" "$HOME" --chdir "$HOME"
+[ "$net" = yes ] || set -- "$@" --unshare-net
+
+# /bin, /lib and the like: links into /usr on a merged-usr system.
+for d in /bin /sbin /lib /lib64; do
+	if [ -L "$d" ]; then
+		set -- "$@" --symlink "$(readlink "$d")" "$d"
+	elif [ -d "$d" ]; then
+		set -- "$@" --ro-bind "$d" "$d"
+	fi
+done
+
+# The locale, the terminal and the input method.
+for v in LANG LANGUAGE LC_ALL LC_CTYPE LC_MESSAGES LC_COLLATE LC_TIME \
+	LC_NUMERIC LC_MONETARY TZ TERM COLORTERM \
+	GTK_IM_MODULE QT_IM_MODULE XMODIFIERS XCURSOR_THEME XCURSOR_SIZE; do
+	eval "isset=\${$v+yes} val=\${$v-}"
+	if [ "$isset" = yes ]; then
+		set -- "$@" --setenv "$v" "$val"
+	fi
+done
+
+if [ -n "$sock" ]; then
+	set -- "$@" --ro-bind "$sock" "$sock" --setenv DISPLAY ":$dpy"
+	[ -z "$xauth" ] || set -- "$@" \
+		--ro-bind "$xauth" "$run/Xauthority" --setenv XAUTHORITY "$run/Xauthority"
+fi
+
+if [ "$audio" = yes ]; then
+	set -- "$@" \
+		--ro-bind-try "$run/pipewire-0" "$run/pipewire-0" \
+		--ro-bind-try "$run/pulse/native" "$run/pulse/native"
+fi
+
+if [ "$gpu" = yes ]; then
+	# Mesa finds the driver of a /dev/dri node through /sys.
+	set -- "$@" --dev-bind /dev/dri /dev/dri \
+		--ro-bind /sys/dev/char /sys/dev/char --ro-bind /sys/devices /sys/devices
+fi
+
+# After the home, so that a path inside the real home lands in it.
+oldifs=$IFS
+IFS=$nl
+set -f
+for b in $binds; do
+	case "$b" in
+	b\ *) set -- "$@" --bind "${b#b }" "${b#b }" ;;
+	r\ *) set -- "$@" --ro-bind "${b#r }" "${b#r }" ;;
+	esac
+done
+set +f
+IFS=$oldifs
+
+set -- "$@" --
+# A D-Bus session of its own. Without one, a program looks the session's
+# bus up through X and gets an address it cannot reach.
+if command -v dbus-run-session >/dev/null; then
+	set -- "$@" dbus-run-session --
+fi
+while [ "$n" -gt 0 ]; do
+	set -- "$@" "$1"
+	shift
+	n=$((n - 1))
+done
+exec bwrap "$@"

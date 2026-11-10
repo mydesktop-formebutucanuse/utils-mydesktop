@@ -1,0 +1,107 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Start the X server with the Xnamespace extension (XLibre) on, with the X
+# namespaces listed in ~/.config/nsrun/xnamespaces. startx runs it in place
+# of /etc/X11/xinit/xserverrc when ~/.xserverrc is:
+#
+#   #!/bin/sh
+#   exec nsrun-xserver "$@"
+#
+# The server puts a client into a namespace by the cookie the client gives.
+# So at every start this writes a new cookie for each namespace into
+# $XDG_RUNTIME_DIR/nsrun/x/NAME.Xauthority, which `nsrun -x NAME` gives to
+# the program it runs, and the server's namespace configuration into
+# $XDG_RUNTIME_DIR/nsrun/x/conf. The cookie startx made for the session
+# becomes the root namespace's, so the session itself is as it was.
+#
+# Without the list, or without a cookie from startx, the server starts as
+# /etc/X11/xinit/xserverrc starts it, without the extension.
+# See nsrun/README.md.
+
+# The script that starts the server itself.
+sysrc=${NSRUN_SERVERRC:-/etc/X11/xinit/xserverrc}
+list=${XDG_CONFIG_HOME:-$HOME/.config}/nsrun/xnamespaces
+dir=${XDG_RUNTIME_DIR:-}/nsrun/x
+
+start() {
+	if [ -x "$sysrc" ]; then
+		exec "$sysrc" "$@"
+	fi
+	exec X "$@"
+}
+
+# Why the extension stays off, and the server as it would be without us.
+plain() {
+	echo "${0##*/}: $1; X starts without Xnamespace" >&2
+	shift
+	start "$@"
+}
+
+# No list: nothing was asked for.
+[ -f "$list" ] || start "$@"
+
+# The display and the -auth file among the server's arguments.
+display=
+auth=
+prev=
+for a in "$@"; do
+	case "$prev:$a" in
+	-auth:*) auth=$a ;;
+	*::[0-9]*) [ -n "$display" ] || display=$a ;;
+	esac
+	prev=$a
+done
+
+[ -n "${XDG_RUNTIME_DIR:-}" ] || plain "XDG_RUNTIME_DIR is not set" "$@"
+[ -n "$display" ] || plain "no display among the arguments" "$@"
+# Without -auth the server lets every local client in, and into no namespace.
+[ -n "$auth" ] && [ -f "$auth" ] || plain "no -auth file from startx" "$@"
+for tool in xauth mcookie sed; do
+	command -v "$tool" >/dev/null || plain "$tool is missing" "$@"
+done
+cookie=$(xauth -f "$auth" list 2>/dev/null | sed -n '1s/.*[[:space:]]//p')
+[ -n "$cookie" ] || plain "no cookie in $auth" "$@"
+
+umask 077
+mkdir -p "$dir" || plain "cannot make $dir" "$@"
+# The last start's cookies are no good any more.
+rm -f "$dir"/*.Xauthority "$dir/conf" "$dir/log" "$dir/tmp"
+conf=$dir/conf
+
+# Before the first "namespace" line: the root namespace.
+echo "auth MIT-MAGIC-COOKIE-1 $cookie" >"$conf"
+count=0
+while read -r name flags || [ -n "$name" ]; do
+	case "$name" in
+	'' | \#*) continue ;;
+	root | anon | *[!A-Za-z0-9_-]*)
+		echo "${0##*/}: $list: $name cannot be a namespace's name" >&2
+		continue
+		;;
+	esac
+	[ ! -e "$dir/$name.Xauthority" ] || continue
+	allow=
+	for f in $flags; do
+		case "$f" in
+		\#*) break ;;
+		mouse-motion | shape | transparency | xinput | xkeyboard) allow="$allow $f" ;;
+		*) echo "${0##*/}: $list: $name: unknown: $f" >&2 ;;
+		esac
+	done
+	c=$(mcookie)
+	printf 'namespace %s\n  auth MIT-MAGIC-COOKIE-1 %s\n' "$name" "$c" >>"$conf"
+	[ -z "$allow" ] || printf '  allow%s\n' "$allow" >>"$conf"
+	# Under the "any host" family: the hostname is another one inside
+	# nsrun's UTS namespace.
+	xauth -q -f "$dir/tmp" add "$display" . "$c" 2>/dev/null
+	xauth -f "$dir/tmp" nlist | sed 's/^..../ffff/' |
+		xauth -q -f "$dir/$name.Xauthority" nmerge - 2>/dev/null
+	rm -f "$dir/tmp"
+	count=$((count + 1))
+done <"$list"
+
+[ "$count" -gt 0 ] || plain "no namespace in $list" "$@"
+
+# The extension writes what it blocks to the server's standard output.
+exec >"$dir/log"
+start "$@" -namespace "$conf"

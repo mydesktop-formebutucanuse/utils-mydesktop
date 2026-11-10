@@ -1,16 +1,20 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Install utils-mydesktop with emerge: puts the live ebuild
-# x11-misc/utils-mydesktop-9999 into a local overlay, accepts its (empty)
+# Install wmutils with emerge: puts the live ebuild
+# x11-misc/wmutils-9999 into a local overlay, accepts its (empty)
 # keywords, emerges it, and removes the udev rule a hand install left in
-# /etc. Run as root, again whenever the ebuild changes:
+# /etc. The package was x11-misc/utils-mydesktop until November 2026: its
+# ebuild and keywords go, and it leaves the world file, so that emerge takes
+# it off once the new one, which blocks it, is merged. Run as root, again
+# whenever the ebuild changes:
 #   sudo sh gentoo/install.sh [OVERLAY]   default overlay: mydesktop
 # Code updates need no rerun: the ebuild builds the latest commit on GitHub,
-#   sudo emerge --oneshot x11-misc/utils-mydesktop
+#   sudo emerge --oneshot x11-misc/wmutils
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-pkg=x11-misc/utils-mydesktop
+pkg=x11-misc/wmutils
+oldpkg=x11-misc/utils-mydesktop
 overlay=${1:-mydesktop}
 keywords=/etc/portage/package.accept_keywords/$overlay
 rule=90-autobrightd.rules
@@ -26,8 +30,8 @@ if [ -z "$repo" ] || [ ! -d "$repo" ]; then
 	exit 1
 fi
 
-install -D -m 644 "$here/$pkg/utils-mydesktop-9999.ebuild" "$repo/$pkg/utils-mydesktop-9999.ebuild"
-echo "installed $repo/$pkg/utils-mydesktop-9999.ebuild"
+install -D -m 644 "$here/$pkg/wmutils-9999.ebuild" "$repo/$pkg/wmutils-9999.ebuild"
+echo "installed $repo/$pkg/wmutils-9999.ebuild"
 
 # A live ebuild has no keywords.
 [ -f /etc/portage/package.accept_keywords ] && keywords=/etc/portage/package.accept_keywords
@@ -35,6 +39,23 @@ if ! grep -qs "^$pkg[[:space:]]" "$keywords"; then
 	mkdir -p "$(dirname "$keywords")"
 	echo "$pkg **" >>"$keywords"
 	echo "added '$pkg **' to $keywords"
+fi
+
+# What the old name left in the overlay and in the keywords.
+if [ -e "$repo/$oldpkg/${oldpkg#*/}-9999.ebuild" ]; then
+	rm -f "$repo/$oldpkg/${oldpkg#*/}-9999.ebuild"
+	rmdir "$repo/$oldpkg" 2>/dev/null || true
+	echo "removed $repo/$oldpkg/${oldpkg#*/}-9999.ebuild (the old name)"
+fi
+if grep -qs "^$oldpkg[[:space:]]" "$keywords"; then
+	sed -i "\\|^$oldpkg[[:space:]]|d" "$keywords"
+	echo "removed '$oldpkg **' from $keywords"
+fi
+
+# In the world file the old package would stop emerge: it only takes a
+# blocked package off by itself when nothing asks for it.
+if portageq has_version / "$oldpkg"; then
+	emerge --deselect "$oldpkg"
 fi
 
 emerge "$pkg"

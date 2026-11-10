@@ -1,0 +1,39 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: apple: t6000-j314s: boot the PMP
+
+The Power Management Processor's driver (CONFIG_APPLE_PMP, pmp.ko) is
+built, but its node is disabled, so the PMP is never booted and its
+power reports go unread. The Asahi Linux 7.0 progress report measured
+about half a watt (some 20 %) less at idle on a 14-inch M1 Pro with it
+on, and leaves it off by default until the driver is upstream; this is
+the opt-in it describes: define APPLE_USE_PMP before the SoC includes,
+which routes the DCP, DCPext, ISP and AVD power domains through the PMP
+report entries, and enable the PMP node. The j314/j316 board file
+already enables the ISP report entry that the ISP then uses.
+
+Only the 14-inch M1 Pro (J314s) board is changed. The compiled DTB
+differs from the stock one only in the pmp alias, the PMP node's status
+and those power-domain references.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/arm64/boot/dts/apple/t6000-j314s.dts
++++ b/arch/arm64/boot/dts/apple/t6000-j314s.dts
+@@ -9,6 +9,9 @@
+ 
+ /dts-v1/;
+ 
++/* Boot the PMP and route the DCP, ISP and AVD power domains through it. */
++#define APPLE_USE_PMP
++
+ #include "t6000.dtsi"
+ #include "t600x-j314-j316.dtsi"
+ 
+@@ -41,3 +44,7 @@
+ 	compatible = "apple,j314-macaudio", "apple,macaudio";
+ 	model = "MacBook Pro J314";
+ };
++
++&pmp {
++	status = "okay";
++};

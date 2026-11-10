@@ -1,0 +1,325 @@
+From: James Calligeros <jcalligeros99@gmail.com>
+Subject: [PATCH] drm/apple: Adaptive Sync / ProMotion (VRR), behind appledrm.force_vrr
+
+Backport of the seven commits at the top of chadmed/linux dcp/vrr
+(AsahiLinux/linux pull request 477, not merged yet), squashed:
+
+  23682c5d3cbd drm: apple: Do not set IOMFBParameter_adaptive_sync on poweron
+  459e0490f7d5 drm: apple: Add preliminary VRR support
+  11741c81a788 drm: apple: Force modeset when VRR is toggled
+  67e5ae50952c drm: apple: Set swap timestamps to sane values for Adaptive Sync
+  50830fcfe5aa drm: apple: Set min and max VRRs for MacBook Pros
+  8836a0f2c7d9 drm: apple: Only use swap timestamps if VRR is actually active
+  8a808006a701 NOUPSTREAM: drm: apple: Hide VRR behind a module parameter
+
+DCP does VRR itself: it is switched on by setting the adaptive sync
+parameter's minimum refresh rate and then setting the mode again, and
+the refresh rate then follows the swap timestamps. With
+appledrm.force_vrr=1, every mode set on a VRR-capable display (the
+14/16-inch MacBook Pro panels at 120 Hz, 24 to 120 Hz; external
+displays whose EDID gives a range) turns it on. KMS and the compositor
+are not told (vrr_capable stays 0), because KMS forbids the mode set
+DCP needs. Without the parameter the display runs as before.
+
+Upstream marks this experimental: the pull request reports mpv's gpu
+and gpu-next outputs halting the GPU in fullscreen on the internal
+display.
+
+Adjusted for asahi-7.2.14-1: the ns_to_mach() helper is added in front
+of iomfb_flush(), whose signature here takes a drm_atomic_commit; the
+rest applies with offsets. Builds without warnings against
+7.2.14-p1-asahi-dist.
+
+Signed-off-by: James Calligeros <jcalligeros99@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/apple/apple_drv.c
++++ b/drivers/gpu/drm/apple/apple_drv.c
+@@ -343,6 +343,10 @@ static int apple_probe_per_dcp(struct device *dev,
+ 	if (ret)
+ 		return ret;
+ 
++	ret = drm_connector_attach_vrr_capable_property(&connector->base);
++	if (ret)
++		return ret;
++
+ 	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
+ 	connector->connected = false;
+ 	connector->dcp = dcp;
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -185,6 +185,7 @@ struct apple_dcp {
+ 	bool during_modeset;
+ 	bool valid_mode;
+ 	bool use_timestamps;
++	bool vrr_enabled;
+ 	struct dcp_set_digital_out_mode_req mode;
+ 
+ 	/* completion for active turning true */
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -58,6 +58,10 @@ static bool unstable_edid = true;
+ module_param(unstable_edid, bool, 0644);
+ MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
+ 
++bool force_vrr;
++module_param(force_vrr, bool, 0644);
++MODULE_PARM_DESC(force_vrr, "Always enable Adaptive Sync/ProMotion on supported displays");
++
+ /* copied and simplified from drm_vblank.c */
+ static void send_vblank_event(struct drm_device *dev,
+ 		struct drm_pending_vblank_event *e,
+@@ -345,6 +349,10 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
+ 		return -EINVAL;
+ 	}
+ 
++	// if (dcp->vrr_enabled != crtc_state->vrr_enabled) {
++	// 	crtc_state->mode_changed = true;
++	// }
++
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -244,6 +244,7 @@ void dcp_hotplug(struct work_struct *work)
+ 
+ 	if (!connector->connected) {
+ 		drm_edid_free(connector->drm_edid);
++		drm_connector_set_vrr_capable_property(&connector->base, false);
+ 		connector->drm_edid = NULL;
+ 	}
+ 
+--- a/drivers/gpu/drm/apple/iomfb_template.c
++++ b/drivers/gpu/drm/apple/iomfb_template.c
+@@ -34,6 +34,8 @@
+ /* Register defines used in bandwidth setup structure */
+ #define REG_DOORBELL_BIT(idx) (2 + (idx))
+ 
++extern bool force_vrr;
++
+ struct dcp_wait_cookie {
+ 	struct kref refcount;
+ 	struct completion done;
+@@ -553,8 +555,9 @@ static u8 dcpep_cb_prop_chunk(struct apple_dcp *dcp,
+ static bool dcpep_process_chunks(struct apple_dcp *dcp,
+ 				 struct dcp_set_dcpav_prop_end_req *req)
+ {
++	// struct apple_connector *connector = dcp->connector;
+ 	struct dcp_parse_ctx ctx;
+-	int ret;
++	int ret; //, i;
+ 
+ 	if (!dcp->chunks.data) {
+ 		dev_warn(dcp->dev, "ignoring spurious end\n");
+@@ -596,6 +599,15 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
+ 		dcp_set_dimensions(dcp);
+ 	}
+ 
++	// if (connector) {
++	// 	for (i = 0; i < dcp->nr_modes; i++) {
++	// 		if (dcp->modes[i].vrr) {
++	// 			drm_connector_set_vrr_capable_property(&connector->base, true);
++	// 			break;
++	// 		}
++	// 	}
++	// }
++
+ 	return true;
+ }
+ 
+@@ -791,21 +803,6 @@ static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cooki
+ 	dcp_set_power_state(dcp, false, &req, dcp_on_final, cookie);
+ }
+ 
+-static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
+-{
+-	struct dcp_set_parameter_dcp param = {
+-		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+-		.value = { 0 },
+-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+-		.count = 3,
+-#else
+-		.count = 1,
+-#endif
+-	};
+-
+-	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_power_state, cookie);
+-}
+-
+ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
+ {
+ 	struct dcp_wait_cookie *cookie;
+@@ -822,15 +819,11 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
+ 	/* increase refcount to ensure the receiver has a reference */
+ 	kref_get(&cookie->refcount);
+ 
+-	if (dcp->main_display) {
+-		handle = 0;
+-		dcp_set_display_device(dcp, false, &handle, dcp_on_set_power_state,
+-				       cookie);
+-	} else {
+-		handle = 2;
+-		dcp_set_display_device(dcp, false, &handle,
+-				       dcp_on_set_parameter, cookie);
+-	}
++	handle = dcp->main_display ? 0 : 2;
++
++	dcp_set_display_device(dcp, false, &handle, dcp_on_set_power_state,
++			       cookie);
++
+ 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(10000));
+ 
+ 	if (ret == 0) {
+@@ -1206,6 +1199,33 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
+ 	}
+ }
+ 
++/* Changes to Adaptive Sync require a trip through set_digital_out_mode */
++static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out, void *cookie)
++{
++	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
++				 complete_set_digital_out_mode, cookie);
++}
++
++static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 rate, void *cookie)
++{
++	struct dcp_set_parameter_dcp param = {
++		.param = IOMFBPARAM_ADAPTIVE_SYNC,
++		.value = {
++			rate,              /* minRR */
++			0,                 /* mediaTargetRate */
++			0,                 /* Fractional Rate (?) */
++			0,                 /* unused */
++		},
++#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
++		.count = 3,
++#else
++		.count = 1,
++#endif
++	};
++
++	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_adaptive_sync, cookie);
++}
++
+ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 			       struct drm_crtc_state *crtc_state)
+ {
+@@ -1245,8 +1265,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 		.timing_mode_id = mode->timing_mode_id
+ 	};
+ 
+-	/* Keep track of suspected vrr modes */
+-	dcp->use_timestamps = mode->vrr;
++	/* Use DCP swap timestamps on MacBook Pros with VRR */
++	dcp->use_timestamps = mode->vrr && dcp->main_display;
+ 
+ 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+ 	if (!cookie) {
+@@ -1260,8 +1280,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 
+ 	dcp->during_modeset = true;
+ 
+-	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
+-				 complete_set_digital_out_mode, cookie);
++	if (mode->vrr) {
++		dcp_set_adaptive_sync(dcp, force_vrr ? mode->min_vrr : 0, cookie);
++	} else {
++		dcp_set_digital_out_mode(dcp, false, &dcp->mode,
++					 complete_set_digital_out_mode, cookie);
++	}
+ 
+ 	/*
+ 	 * The DCP firmware has an internal timeout of ~8 seconds for
+@@ -1289,10 +1313,20 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 			jiffies_to_msecs(ret));
+ 	}
+ 	dcp->valid_mode = true;
++	dcp->vrr_enabled = mode->vrr && force_vrr;
+ 
+ 	return 0;
+ }
+ 
++/*
++ * DCP timestamps are expressed in system timer ticks. Approximate
++ * this by converting from ktime nanoseconds to 24 MHz ticks.
++ */
++static u64 ns_to_mach(u64 ns)
++{
++	return ns * 3 / 125;
++}
++
+ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
+ {
+ 	struct drm_plane *plane;
+@@ -1397,14 +1431,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
+ 		req->clear = 1;
+ 	}
+ 
+-	if (has_surface && dcp->use_timestamps) {
++	if (has_surface && (dcp->use_timestamps || crtc_state->vrr_enabled || force_vrr)) {
+ 		/*
+-		 * Fake timstamps to get 120hz refresh rate. It looks
+-		 * like the actual value does not matter, as long  as it is non zero.
++		 * TODO: ascertain with certainty what these timestamps
++		 * are. They are something to do with presentation timing,
++		 * but that is all we know for sure. These values seem to
++		 * work well with VRR.
+ 		 */
+-		req->swap.ts1 = 120;
+-		req->swap.ts2 = 120;
+-		req->swap.ts3 = 120;
++		req->swap.unk_pres_ts1 = ns_to_mach(ktime_get_ns());
++		req->swap.unk_pres_ts2 = ns_to_mach(ktime_to_ns(dcp->swap_start));
++		req->swap.unk_pres_ts3 = req->swap.unk_pres_ts1;
+ 	}
+ 
+ 	/* These fields should be set together */
+--- a/drivers/gpu/drm/apple/iomfb_template.h
++++ b/drivers/gpu/drm/apple/iomfb_template.h
+@@ -18,14 +18,14 @@
+ #include "version_utils.h"
+ 
+ struct DCP_FW_NAME(dcp_swap) {
+-	u64 ts1;
+-	u64 ts2;
++	u64 unk_pres_ts1;
++	u64 unk_pres_ts2;
+ 
+ 	u64 unk_10;
+ 	u64 unk_18;
+ 	u64 ts64_unk;
+ 	u64 unk_28;
+-	u64 ts3;
++	u64 unk_pres_ts3;
+ 	u64 unk_38;
+ 
+ 	u64 flags1;
+--- a/drivers/gpu/drm/apple/parser.c
++++ b/drivers/gpu/drm/apple/parser.c
+@@ -524,18 +524,21 @@ static int parse_mode(struct dcp_parse_ctx *handle,
+ 	/*
+ 	* HACK:
+ 	* Mark the 120 Hz mode on j314/j316 (identified by resolution) as vrr.
+-	* We still do not know how to drive VRR but at least seetinng timestamps
+-	* in the the swap_surface message to non-zero values drives the display
+-	* at 120 fps.
++	* Setting timestamps in the the swap_surface message to non-zero
++	* values drives the display at 120 fps.
+ 	*/
+ 	if (vert.precise_sync_rate >> 16 == 120 &&
+ 	    ((horiz.active == 3024 && vert.active == 1964) ||
+-	     (horiz.active == 3456 && vert.active == 2234)))
++	     (horiz.active == 3456 && vert.active == 2234))) {
++		out->min_vrr = 24 << 16;
++		out->max_vrr = 120 << 16;
+ 		out->vrr = true;
++	}
+ 
+ 	if (min_vrr && max_vrr) {
+ 		out->min_vrr = min_vrr;
+ 		out->max_vrr = max_vrr;
++		out->vrr = true;
+ 	}
+ 
+ 	vert.active -= notch_height;
