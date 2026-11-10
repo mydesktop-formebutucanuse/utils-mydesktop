@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Install wmutils with emerge: puts the live ebuild
 # x11-misc/wmutils-9999 into a local overlay, accepts its (empty)
-# keywords, emerges it, and removes the udev rule a hand install left in
-# /etc. The package was x11-misc/utils-mydesktop until November 2026: its
-# ebuild and keywords go, and it leaves the world file, so that emerge takes
-# it off once the new one, which blocks it, is merged. Run as root, again
-# whenever the ebuild changes:
+# keywords and those of libdockapp, which the dock apps need and Gentoo has
+# not keyworded for arm64, emerges it, and removes the udev rule a hand
+# install left in /etc. The package was x11-misc/utils-mydesktop until
+# November 2026: its ebuild and keywords go, and it leaves the world file, so
+# that emerge takes it off once the new one, which blocks it, is merged. So
+# do Gentoo's x11-plugins/wmclock and x11-plugins/wmacpi, which the dock apps
+# of this package replace. Run as root, again whenever the ebuild changes:
 #   sudo sh gentoo/install.sh [OVERLAY]   default overlay: mydesktop
 # Code updates need no rerun: the ebuild builds the latest commit on GitHub,
 #   sudo emerge --oneshot x11-misc/wmutils
@@ -15,6 +17,10 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 pkg=x11-misc/wmutils
 oldpkg=x11-misc/utils-mydesktop
+# Packages that install the files of the dock apps.
+replaced="x11-plugins/wmclock x11-plugins/wmacpi"
+# Wanted by the dock apps; in Gentoo without an arm64 keyword.
+dockapplib=x11-libs/libdockapp
 overlay=${1:-mydesktop}
 keywords=/etc/portage/package.accept_keywords/$overlay
 rule=90-autobrightd.rules
@@ -40,6 +46,11 @@ if ! grep -qs "^$pkg[[:space:]]" "$keywords"; then
 	echo "$pkg **" >>"$keywords"
 	echo "added '$pkg **' to $keywords"
 fi
+# Any file of package.accept_keywords may accept libdockapp already.
+if ! grep -rqs "^$dockapplib[[:space:]]" /etc/portage/package.accept_keywords; then
+	echo "$dockapplib **" >>"$keywords"
+	echo "added '$dockapplib **' to $keywords"
+fi
 
 # What the old name left in the overlay and in the keywords.
 if [ -e "$repo/$oldpkg/${oldpkg#*/}-9999.ebuild" ]; then
@@ -52,11 +63,13 @@ if grep -qs "^$oldpkg[[:space:]]" "$keywords"; then
 	echo "removed '$oldpkg **' from $keywords"
 fi
 
-# In the world file the old package would stop emerge: it only takes a
-# blocked package off by itself when nothing asks for it.
-if portageq has_version / "$oldpkg"; then
-	emerge --deselect "$oldpkg"
-fi
+# In the world file a blocked package would stop emerge: it only takes one
+# off by itself when nothing asks for it.
+for blocked in $oldpkg $replaced; do
+	if portageq has_version / "$blocked"; then
+		emerge --deselect "$blocked"
+	fi
+done
 
 emerge "$pkg"
 
