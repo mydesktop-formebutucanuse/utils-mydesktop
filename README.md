@@ -1,4 +1,4 @@
-# utils-mydesktop
+# wmutils
 
 Small desktop utilities, written for a Window Maker (X11) desktop on
 Gentoo (Asahi Linux, Apple Silicon MacBook).
