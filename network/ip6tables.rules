@@ -1,0 +1,26 @@
+# wmutils network: the IPv6 firewall. network/install.sh installs it
+# in /usr/local/share/wmutils/network, and
+# /etc/local.d/wmutils-firewall.start loads it at every boot with
+# ip6tables-restore --noflush, which replaces this one chain and leaves
+# every other rule as it is. See network/README.md.
+#
+# As iptables.rules, plus the parts of ICMPv6 that IPv6 does not work
+# without. Echo requests (ping) are not among them.
+*filter
+:wmutils-in - [0:0]
+-A wmutils-in -i lo -j ACCEPT
+# Answers to what this machine sent, and the ICMPv6 errors about it.
+-A wmutils-in -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# Neighbour discovery, IPv6's ARP: router advertisements (134), neighbour
+# solicitations (135) and advertisements (136). A hop limit of 255 means the
+# packet comes from this link: a router would have lowered it.
+-A wmutils-in -p ipv6-icmp -m icmp6 --icmpv6-type 134 -m hl --hl-eq 255 -j ACCEPT
+-A wmutils-in -p ipv6-icmp -m icmp6 --icmpv6-type 135 -m hl --hl-eq 255 -j ACCEPT
+-A wmutils-in -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT
+# The router's multicast listener queries (130). A switch that hears no
+# answer stops forwarding the neighbour solicitations meant for this machine.
+-A wmutils-in -s fe80::/10 -p ipv6-icmp -m icmp6 --icmpv6-type 130 -j ACCEPT
+# The DHCPv6 server's answers.
+-A wmutils-in -s fe80::/10 -p udp -m udp --sport 547 --dport 546 -j ACCEPT
+-A wmutils-in -j DROP
+COMMIT

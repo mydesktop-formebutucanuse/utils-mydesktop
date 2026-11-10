@@ -1,0 +1,26 @@
+#!/bin/sh
+# wmutils: installed as /etc/local.d/wmutils-firewall.start
+# by network/install.sh. s6-rc's init-local (OpenRC's local service does the
+# same) runs it at every boot; install.sh runs it once to load the firewall
+# at once. Running it again is harmless.
+#
+# Loads the wmutils-in chain for IPv4 and IPv6 and has INPUT jump to
+# it first. --noflush replaces that one chain, in one step, and leaves every
+# other rule as it is. If one of the two does not load, the other still
+# does. See network/README.md.
+
+share=/usr/local/share/wmutils/network
+chain=wmutils-in
+status=0
+
+for ipt in iptables ip6tables; do
+	if ! "$ipt-restore" -w --noflush <"$share/$ipt.rules"; then
+		echo "$0: $share/$ipt.rules did not load; $ipt is as it was" >&2
+		status=1
+	elif ! "$ipt" -w -C INPUT -j "$chain" 2>/dev/null &&
+		! "$ipt" -w -I INPUT -j "$chain"; then
+		echo "$0: $ipt: INPUT does not jump to $chain" >&2
+		status=1
+	fi
+done
+exit $status

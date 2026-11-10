@@ -1,0 +1,19 @@
+# wmutils network: the IPv4 firewall. network/install.sh installs it
+# in /usr/local/share/wmutils/network, and
+# /etc/local.d/wmutils-firewall.start loads it at every boot with
+# iptables-restore --noflush, which replaces this one chain and leaves every
+# other rule as it is. See network/README.md.
+#
+# INPUT jumps to the chain first. Nothing that arrives unasked gets past it:
+# no connection to any port, and no answer to ping. Connections this machine
+# starts are not limited.
+*filter
+:wmutils-in - [0:0]
+-A wmutils-in -i lo -j ACCEPT
+# Answers to what this machine sent, and the ICMP errors about it.
+-A wmutils-in -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# The DHCP server's answers. The first ones come in on a packet socket,
+# before the firewall, but a renewal's answer comes in here.
+-A wmutils-in -p udp -m udp --sport 67 --dport 68 -j ACCEPT
+-A wmutils-in -j DROP
+COMMIT
