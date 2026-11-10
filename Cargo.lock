@@ -11,9 +11,5 @@ name = "mediakeyd"
 version = "0.1.0"
 
 [[package]]
-name = "notchbar"
-version = "0.1.0"
-
-[[package]]
 name = "scd"
 version = "0.1.0"

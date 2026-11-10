@@ -130,7 +130,7 @@ it starts, so it needs no patch but takes a reboot with the new initramfs.
 
 Windows do not know about the notch: anything placed at the very top, a
 maximised window's title bar for one, goes partly under it. A dock window
-that fills the strip and reserves it with a strut (notchbar does that)
+that fills the strip and reserves it with a strut
 keeps them below it. Window Maker's own icons and clip are not in the
 middle of the top edge and are not covered.
 
