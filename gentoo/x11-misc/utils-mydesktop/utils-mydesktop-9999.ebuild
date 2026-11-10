@@ -6,7 +6,7 @@ EAPI=8
 RUST_MIN_VER="1.85.0"
 inherit cargo git-r3 udev
 
-DESCRIPTION="Window Maker desktop utilities: mediakeyd, autobrightd, scd and backlight"
+DESCRIPTION="Window Maker desktop utilities: mediakeyd, autobrightd, scd, notchbar and backlight"
 HOMEPAGE="https://github.com/mydesktop-formebutucanuse/utils-mydesktop"
 EGIT_REPO_URI="https://github.com/mydesktop-formebutucanuse/utils-mydesktop.git"
 
@@ -15,6 +15,7 @@ SLOT="0"
 
 DEPEND="
 	x11-libs/libX11
+	x11-libs/libXft
 	x11-libs/libXi
 "
 # backlight: dbus-send for the keyboard, pkill to signal autobrightd
@@ -29,7 +30,7 @@ src_unpack() {
 }
 
 src_install() {
-	dobin "$(cargo_target_dir)"/{autobrightd,mediakeyd,scd}
+	dobin "$(cargo_target_dir)"/{autobrightd,mediakeyd,notchbar,scd}
 	dobin backlight/backlight
 	# Lets the video group write the backlights, so autobrightd runs as
 	# the desktop user.
@@ -37,7 +38,7 @@ src_install() {
 
 	dodoc README.md
 	local tool
-	for tool in autobrightd backlight kernel mediakeyd scd; do
+	for tool in autobrightd backlight kernel mediakeyd notchbar scd; do
 		docinto "${tool}"
 		dodoc "${tool}"/README.md
 	done
@@ -49,7 +50,8 @@ pkg_postinst() {
 	udev_reload
 	elog "Start the daemons with the X session, e.g. in"
 	elog "~/GNUstep/Library/WindowMaker/autostart (scd before the others):"
-	elog "  scd &  mediakeyd &  autobrightd &"
+	elog "  scd &  mediakeyd &  autobrightd &  notchbar &"
+	elog "notchbar needs the notch shown: appledrm.show_notch=1 (see its README)."
 	elog "autobrightd needs the desktop user in the video group; the udev rule"
 	elog "takes effect for the backlights at the next boot, or after"
 	elog "  udevadm trigger --action=add /sys/class/backlight/* /sys/class/leds/kbd_backlight"
