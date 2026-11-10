@@ -1,0 +1,23 @@
+# nsrun-xserver: the X namespaces the X server starts with. Copy to
+# ~/.config/nsrun/xnamespaces; it is read when X starts, so a new name
+# takes a new X session. Without the file, X starts without Xnamespace.
+#
+# One namespace a line: NAME [ALLOW]...
+#
+# `nsrun -x NAME` runs a program in the namespace NAME. Its clients see
+# and reach only each other: not the other windows, the keyboard while
+# another window has it, or the session's clipboard. ALLOW gives some of
+# that back:
+#
+#   mouse-motion   pointer motion outside its own windows
+#   shape          windows that are not rectangles (the SHAPE extension)
+#   transparency   windows that show what is under them
+#   xinput         the XInput extension: touchpad gestures, smooth scrolling
+#   xkeyboard      all of XKEYBOARD, changing the keyboard map included,
+#                  instead of only reading it
+#
+# "root" and "anon" are the server's own: the session, and clients whose
+# cookie belongs to no namespace.
+
+web
+#term xinput shape
