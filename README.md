@@ -8,6 +8,7 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 | [mediakeyd](mediakeyd) | Runs commands for volume, brightness and media keys without grabbing them, so focused windows do not flicker |
 | [backlight](backlight) | The brightness keys' command: screen steps through autobrightd, keyboard through logind |
 | [autobrightd](autobrightd) | Sets the screen and keyboard backlight from the ambient light sensor, and steps aside when you change them |
+| [notchbar](notchbar) | Shows the battery level and the time beside the MacBook's camera notch, like the macOS menu bar |
 | [scd](scd) | Gives Window Maker's GUI scale factor to GTK, Chromium, Electron and Qt applications and to the cursors, without scaling any of them twice |
 | [kernel](kernel) | Asahi kernel patches: the panel backlight in 1/64 nit and up to 60 updates a second, so brightness changes have no visible steps |
 | [audio](audio) | Puts the sound system ahead of everything else on the CPU: PipeWire and asahi-audio's speaker DSP run in real time, above every other program and interrupt thread |
@@ -16,7 +17,7 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 
 [gentoo](gentoo) has a live ebuild, `x11-misc/utils-mydesktop-9999`, that
 builds the latest commit here and installs all the tools: `mediakeyd`,
-`autobrightd`, `scd` and `backlight` in `/usr/bin`, autobrightd's udev rule
+`autobrightd`, `scd`, `notchbar` and `backlight` in `/usr/bin`, autobrightd's udev rule
 in `/usr/lib/udev/rules.d`, and the READMEs. The kernel patches and the
 audio priorities are separate (see [kernel](kernel) and [audio](audio)).
 
@@ -38,6 +39,7 @@ example in `~/.xinitrc` before `exec wmaker`:
 scd &
 mediakeyd &
 autobrightd &
+notchbar &
 ```
 
 ## Build by hand

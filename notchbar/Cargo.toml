@@ -1,0 +1,10 @@
+[package]
+name = "notchbar"
+version = "0.1.0"
+description = "The clock and the battery beside the MacBook notch, as macOS shows them (X11)"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies: libX11 and libXft are called directly (src/xlib.rs).
