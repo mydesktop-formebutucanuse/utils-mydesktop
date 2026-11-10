@@ -41,7 +41,7 @@ cargo build --release
 install -m 755 target/release/mediakeyd ~/.local/bin/
 ```
 
-Then the configuration (from `/usr/share/doc/utils-mydesktop-9999/mediakeyd/`
+Then the configuration (from `/usr/share/doc/wmutils-9999/mediakeyd/`
 with the package):
 
 ```sh

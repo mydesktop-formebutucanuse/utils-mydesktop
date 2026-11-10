@@ -7,8 +7,8 @@ RUST_MIN_VER="1.85.0"
 inherit cargo git-r3 udev
 
 DESCRIPTION="Window Maker desktop utilities: mediakeyd, autobrightd, scd, notchbar and backlight"
-HOMEPAGE="https://github.com/mydesktop-formebutucanuse/utils-mydesktop"
-EGIT_REPO_URI="https://github.com/mydesktop-formebutucanuse/utils-mydesktop.git"
+HOMEPAGE="https://github.com/mydesktop-formebutucanuse/wmutils"
+EGIT_REPO_URI="https://github.com/mydesktop-formebutucanuse/wmutils.git"
 
 LICENSE="GPL-3+"
 SLOT="0"
@@ -19,14 +19,20 @@ DEPEND="
 	x11-libs/libXi
 "
 # backlight: dbus-send for the keyboard, pkill to signal autobrightd
+# The package was x11-misc/utils-mydesktop until November 2026 and installed
+# the same files: emerge takes it off once this one is merged.
 RDEPEND="${DEPEND}
+	!x11-misc/utils-mydesktop
 	sys-apps/dbus
 	sys-process/procps
 "
 
 src_unpack() {
 	git-r3_src_unpack
+	# cargo.eclass no longer changes into ${S} itself (gentoo commit 0ed513f46179)
+	pushd "${S}" >/dev/null || die
 	cargo_live_src_unpack
+	popd >/dev/null || die
 }
 
 src_install() {
