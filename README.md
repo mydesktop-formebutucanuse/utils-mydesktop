@@ -9,6 +9,7 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 | [backlight](backlight) | The brightness keys' command: screen steps through autobrightd, keyboard through logind |
 | [autobrightd](autobrightd) | Sets the screen and keyboard backlight from the ambient light sensor, and steps aside when you change them |
 | [scd](scd) | Gives Window Maker's GUI scale factor to GTK, Chromium, Electron and Qt applications and to the cursors, without scaling any of them twice |
+| [dockapps](dockapps) | A clock and a battery monitor for the Dock, wmclock and wmacpi, drawn at the GUI scale factor: as large as the tile, where the upstream ones are a small picture in the middle of it |
 | [kernel](kernel) | Asahi kernel patches: the panel backlight in 1/64 nit and up to 60 updates a second, so brightness changes have no visible steps; the PMP on for lower idle power; ProMotion VRR; the full panel height around the notch; a smaller kernel config, without the drivers this MacBook cannot use, that builds 2156 modules instead of 4946 |
 | [audio](audio) | Puts the sound system ahead of everything else on the CPU: PipeWire and asahi-audio's speaker DSP run in real time, above every other program and interrupt thread |
 | [network](network) | Keeps the machine from being found or reached on the networks it joins: a firewall that lets in nothing unasked and does not answer ping, and no hostname or real MAC address given to the network |
@@ -19,9 +20,10 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 
 [gentoo](gentoo) has a live ebuild, `x11-misc/wmutils-9999`, that
 builds the latest commit here and installs all the tools: `mediakeyd`,
-`autobrightd`, `scd`, `backlight`, `nsrun` and `nsrun-xserver`
-in `/usr/bin`, autobrightd's udev rule
-in `/usr/lib/udev/rules.d`, and the READMEs. The kernel patches and config,
+`autobrightd`, `scd`, `backlight`, `nsrun`, `nsrun-xserver` and the dock
+apps `wmclock`, `wmacpi` and `wmacpi-cli` in `/usr/bin`, autobrightd's udev
+rule in `/usr/lib/udev/rules.d`, the dock apps' man pages, and the READMEs.
+The kernel patches and config,
 the audio priorities, the firewall and network settings and SELinux are
 separate (see [kernel](kernel), [audio](audio), [network](network) and
 [selinux](selinux)).
@@ -33,9 +35,16 @@ sudo emerge --oneshot x11-misc/wmutils   # later, for the latest code
 
 `gentoo/install.sh [OVERLAY]` copies the ebuild into the overlay (default
 `mydesktop`), adds `x11-misc/wmutils **` to
-`/etc/portage/package.accept_keywords/OVERLAY`, emerges the package and
-removes the copy of the udev rule a hand install left in
-`/etc/udev/rules.d`. Run it again when the ebuild changes.
+`/etc/portage/package.accept_keywords/OVERLAY`, and `x11-libs/libdockapp **`
+when nothing there accepts that library yet (the dock apps use it, and
+Gentoo has no arm64 keyword for it), emerges the package and removes the
+copy of the udev rule a hand install left in `/etc/udev/rules.d`. Run it
+again when the ebuild changes.
+
+The package takes the place of Gentoo's `x11-plugins/wmclock` and
+`x11-plugins/wmacpi`, which install the same files: `gentoo/install.sh`
+takes them out of the world file, and emerge removes them when it merges
+this one.
 
 Until November 2026 this was utils-mydesktop, and the package
 `x11-misc/utils-mydesktop`. `gentoo/install.sh` replaces that package with
@@ -61,7 +70,14 @@ repository:
 cargo build --release
 ```
 
-Binaries are written to `target/release/`. See each tool's README for
+Binaries are written to `target/release/`. The dock apps are C and have a
+Makefile of their own:
+
+```sh
+make -C dockapps
+```
+
+Theirs are written to `dockapps/build/`. See each tool's README for
 installing and configuring it.
 
 ## License

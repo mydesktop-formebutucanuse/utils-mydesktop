@@ -1,0 +1,31 @@
+The dock apps here are other people's programs with one change, made in
+November 2026: they draw themselves at Window Maker's GUI scale factor.
+scale.h and the Makefile were written for wmutils and are under the GNU
+General Public License, version 3 or later (../LICENSE), as is each program
+as a whole in the form it has here.
+
+wmclock/
+  wmclock 1.0.16, from the dockapps collection of the Window Maker project
+  (https://www.dockapps.net/wmclock, wmclock-1.0.16.tar.gz).
+  Copyright (C) 1999 Jim Knoble <jmknoble@pobox.com>. Significant portions
+  are derived from asclock by Beat Christen <spiff@longstreet.ch> and are
+  copyright by Beat Christen and the other authors of asclock.
+  GNU General Public License, version 2 or later.
+  Left out: the autoconf and automake files, README, INSTALL, ChangeLog
+  and COPYING.
+  Changed in wmclock.c: the window, its size hints and its shape mask are
+  as many times larger as the scale factor, and the clock is copied to the
+  window through scale_draw() of ../scale.h (drawWindow()); showTime()
+  takes the size of the clock from the pixmap, not from the size hints.
+
+wmacpi/
+  wmacpi 2.4, from the same collection
+  (https://www.dockapps.net/wmacpi, wmacpi-2.4.tar.gz).
+  Copyright (C) 2000, 2001, 2002 timecop@japan.co.jp; rewritten by Simon
+  Fowler <simon@himi.org>; see wmacpi/AUTHORS.
+  GNU General Public License, version 2 or later.
+  Left out: the Makefile, README, INSTALL, ChangeLog, TODO and COPYING.
+  Changed in wmacpi.c: the icon window, its size hints and its shape mask
+  are as many times larger as the scale factor, and the pixmap is copied to
+  the window through scale_draw() of ../scale.h, the pixmap no longer being
+  the window's background when the factor is 2 or more.
