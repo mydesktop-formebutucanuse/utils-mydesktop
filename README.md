@@ -14,7 +14,7 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 | [audio](audio) | Puts the sound system ahead of everything else on the CPU: PipeWire and asahi-audio's speaker DSP run in real time, above every other program and interrupt thread |
 | [network](network) | Keeps the machine from being found or reached on the networks it joins: a firewall that lets in nothing unasked and does not answer ping, and no hostname or real MAC address given to the network |
 | [nsrun](nsrun) | Runs a program in Linux namespaces of its own, with a home of its own, so that it cannot read or change the rest of the system; with XLibre's Xnamespace extension its windows can be cut off from the others too |
-| [selinux](selinux) | Brings SELinux up in permissive mode, one step at a time: the Portage profile, the tools and the policy, the kernel command line and the initramfs, the labels |
+| [selinux](selinux) | Brings SELinux up in permissive mode, one step at a time: the Portage profile, the tools and the policy, the kernel command line and the initramfs, the labels, and s6's init, services and logins in the policy's domains |
 
 ## Install on Gentoo
 

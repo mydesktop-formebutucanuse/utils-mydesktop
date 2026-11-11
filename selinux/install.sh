@@ -8,9 +8,12 @@
 #   sudo sh selinux/install.sh packages   the SELinux tools and the base policy; /etc/selinux/config
 #   sudo sh selinux/install.sh boot       the kernel command line, the initramfs' policy loader, selinuxfs
 #   sudo sh selinux/install.sh relabel    after the reboot: label every file
-#   sudo sh selinux/install.sh remove     undo profile and boot
-# Two things stay by hand, and status says when: the world update after
-# packages, and the new initramfs and the reboot after boot.
+#   sudo sh selinux/install.sh s6         s6's init, services and logins in the policy's domains
+#   sudo sh selinux/install.sh s6-undo    undo s6
+#   sudo sh selinux/install.sh remove     undo profile, boot and s6
+# Three things stay by hand, and status says when: the world update after
+# packages, the new initramfs and the reboot after boot, and the reboot
+# after s6.
 # Enforcing mode is not a step here: see selinux/README.md.
 set -eu
 
@@ -30,6 +33,8 @@ oldstart=/etc/local.d/utils-mydesktop-selinuxfs.start
 # The policy store: Gentoo's default. selinux/make.defaults names it too.
 type=mcs
 contexts=/etc/selinux/$type/contexts/files/file_contexts
+# What ends our line in s6-linux-init's rc.init.
+mark='# wmutils: selinux'
 action=${1:-status}
 
 die() {
@@ -83,6 +88,122 @@ policy_loaded() {
 	[ -d /sys/fs/selinux/class/file ]
 }
 
+# The label of /, as ls shows it: nothing if ls cannot show labels. With a
+# policy loaded every file has one, so nothing then means a coreutils
+# built without selinux: the world update has not run.
+root_label() {
+	l=$(ls -Zd / 2>/dev/null | cut -d' ' -f1)
+	case "$l" in
+	*:*) echo "$l" ;;
+	esac
+}
+
+world_update() {
+	echo "  sudo emerge --ask --verbose --update --deep --newuse @world && sudo dispatch-conf"
+}
+
+# The type in the label of the file $1, as ls shows it.
+type_of() {
+	ls -Zd "$1" 2>/dev/null | cut -d' ' -f1 | cut -d: -f3
+}
+
+# s6-linux-init's files, from where /sbin/init leads: its init script and,
+# beside it, the scripts, of which rc.init starts the services; and
+# s6-supervise, which runs every service. Fails if the init is not
+# s6-linux-init's.
+s6_paths() {
+	init=$(readlink -f /sbin/init) || return 1
+	case "$init" in
+	*/bin/init) ;;
+	*) return 1 ;;
+	esac
+	grep -q s6-linux-init "$init" 2>/dev/null || return 1
+	scripts=${init%/bin/init}/scripts
+	rcinit=$scripts/rc.init
+	hook=$scripts/wmutils-selinux
+	[ -f "$rcinit" ] || return 1
+	supervise=$(command -v s6-supervise) || return 1
+	supervise=$(readlink -f "$supervise")
+}
+
+# The path $1 as a pattern for a file context.
+regex() {
+	printf '%s\n' "$1" | sed 's/\./\\./g'
+}
+
+# The file contexts of the s6 step, one a line: type, kind of file as
+# semanage has it (f a regular file, a any), pattern. The policy has no
+# types for s6, so its files borrow those of the init and the init scripts
+# the policy knows:
+# - the init script init_exec_t, for which the kernel's domain changes to
+#   init_t;
+# - s6-supervise and the rc scripts initrc_exec_t, for which init_t changes
+#   to initrc_t, the domain of init scripts. From there the policy has a
+#   change for every daemon it knows, and for getty, from which a login
+#   gets the user's context;
+# - what s6-linux-init copies to /run before anything can label it
+#   initrc_runtime_t, which is also what initrc_t makes there later.
+s6_contexts() {
+	printf '%s\n' \
+		"init_exec_t f $(regex "$init")" \
+		"initrc_exec_t f $(regex "$supervise")" \
+		"initrc_exec_t f $(regex "$scripts")/.*" \
+		"initrc_runtime_t a /run/service(/.*)?" \
+		"initrc_runtime_t a /run/uncaught-logs(/.*)?"
+}
+
+# Is the file context of type $1, kind $2 and pattern $3 among the local
+# ones?
+has_context() {
+	T=$1 K=$2 P=$3 awk '
+		$1 == ENVIRON["P"] {
+			c = $2
+			if (ENVIRON["K"] == "f") c = ($2 == "--") ? $3 : ""
+			if (split(c, part, ":") >= 3 && part[3] == ENVIRON["T"]) found = 1
+		}
+		END { exit !found }' "$contexts.local" 2>/dev/null
+}
+
+# Do the init script, s6-supervise and rc.init have the types of the s6 step?
+s6_labelled() {
+	[ "$(type_of "$init")" = init_exec_t ] &&
+		[ "$(type_of "$supervise")" = initrc_exec_t ] &&
+		[ "$(type_of "$rcinit")" = initrc_exec_t ]
+}
+
+# Does rc.init run our script?
+s6_hooked() {
+	[ -x "$hook" ] && grep -q " $mark\$" "$rcinit"
+}
+
+# Undoes the s6 step: our line in rc.init, our script, the file contexts
+# and the labels they gave.
+s6_undo() {
+	s6_paths || return 0
+	if grep -q " $mark\$" "$rcinit"; then
+		new=$rcinit.wmutils-new
+		cp -p "$rcinit" "$new"
+		sed "/ $mark\$/d" "$rcinit" >"$new"
+		mv "$new" "$rcinit"
+		echo "took our line out of $rcinit"
+	fi
+	if [ -e "$hook" ]; then
+		rm -f "$hook"
+		echo "removed $hook"
+	fi
+	if command -v semanage >/dev/null; then
+		s6_contexts | while read -r t k p; do
+			has_context "$t" "$k" "$p" || continue
+			semanage fcontext --delete --ftype "$k" "$p" </dev/null
+			echo "file context: $p is the policy's own again"
+		done
+	fi
+	if command -v restorecon >/dev/null && policy_loaded; then
+		restorecon -F "$init" "$supervise"
+		restorecon -RF "$scripts"
+	fi
+}
+
 # The kernel's own list of security modules with selinux in it, for lsm=:
 # before bpf, which stays last, or at the end.
 lsm_list() {
@@ -126,17 +247,29 @@ status)
 	fi
 	b_dracut=$(yesno sh -c '[ -f "$1" ] || [ -f "$2" ]' sh "$dracutconf" "$olddracutconf")
 	b_start=$(yesno sh -c '[ -x "$1" ] || [ -x "$2" ]' sh "$start" "$oldstart")
-	l_root=$(ls -Zd / 2>/dev/null | cut -d' ' -f1)
-	case "$l_root" in
-	*:*) ;;
-	*) l_root= ;;
-	esac
-	echo "kernel    built with SELinux: $k_built; on now: $k_on; policy loaded: $k_policy${mode:+ ($mode)}"
+	l_root=$(root_label)
+	s6=no
+	s6_done=no
+	pid1=
+	if s6_paths; then
+		s6=yes
+		s6_l=$(yesno s6_labelled)
+		s6_h=$(yesno s6_hooked)
+		if [ "$s6_l" = yes ] && [ "$s6_h" = yes ]; then
+			s6_done=yes
+		fi
+		pid1=$(tr -d '\0\n' </proc/1/attr/current 2>/dev/null) || pid1=
+	fi
+	echo "kernel   built with SELinux: $k_built; on now: $k_on; policy loaded: $k_policy${mode:+ ($mode)}"
 	echo "          security modules now: $(cat /sys/kernel/security/lsm 2>/dev/null)"
 	echo "profile   ours: $(yesno ours); USE has selinux: $p_use"
 	echo "packages  tools: $pk_tools; $type policy: $pk_policy; $config: SELINUX=${pk_mode:-(none)} SELINUXTYPE=${pk_type:-(none)}"
 	echo "boot      $cmdline has lsm=${lsm:-?} enforcing=0: $b_file; dracut loads the policy: $b_dracut; selinuxfs at boot: $b_start"
-	echo "labels    /: ${l_root:-(none)}"
+	echo "labels    /: ${l_root:-(ls shows none)}"
+	if [ "$s6" = yes ]; then
+		echo "s6        init, s6-supervise and rc.init have the policy's types: $s6_l; rc.init labels /run and /dev: $s6_h"
+		echo "          init runs as: ${pid1:-(no label)}"
+	fi
 	if [ -e "$oldorig" ] || [ -e "$olddracutconf" ] || [ -e "$oldstart" ]; then
 		echo "old name  some of it is installed as utils-mydesktop; the next step run as root renames it"
 	fi
@@ -149,7 +282,7 @@ status)
 		echo "Next: sudo sh $0 packages"
 	elif [ "$b_file" = no ] || [ "$b_dracut" = no ] || [ "$b_start" = no ]; then
 		echo "Next: the world update, if it is not done:"
-		echo "  sudo emerge --ask --verbose --update --deep --newuse @world && sudo dispatch-conf"
+		world_update
 		echo "then: sudo sh $0 boot"
 	elif [ "$k_on" = no ]; then
 		echo "Next: the initramfs and the UKI with the new command line, then a reboot:"
@@ -157,10 +290,25 @@ status)
 	elif [ "$k_policy" = no ]; then
 		echo "SELinux is on in the kernel, but no policy is loaded or selinuxfs is not mounted."
 		echo "Was the initramfs made after the boot step? sudo emerge --config sys-kernel/asahi-kernel"
-	elif [ -z "$l_root" ] || [ "${l_root#*:root_t}" = "$l_root" ]; then
+	elif [ -z "$l_root" ]; then
+		echo "Next: the world update, which has not run: ls shows no labels, so"
+		echo "coreutils is still built without selinux."
+		world_update
+		echo "then: sudo sh $0 relabel"
+	elif [ "${l_root#*:root_t}" = "$l_root" ]; then
 		echo "Next: sudo sh $0 relabel"
+	elif [ "$s6" = yes ] && [ "$s6_done" = no ]; then
+		echo "SELinux is on, $mode, and the files are labelled, but s6 starts everything"
+		echo "in the kernel's own domain, where the policy confines nothing."
+		echo "Next: sudo sh $0 s6"
+	elif [ "$s6" = yes ] && [ "${pid1#*:init_t:}" = "$pid1" ]; then
+		echo "SELinux is on, $mode, and the files are labelled."
+		echo "Next: a reboot, after which init, the services and the logins run in the policy's domains."
 	else
 		echo "SELinux is on, $mode, and the files are labelled."
+		if [ "$s6" = yes ]; then
+			echo "init runs as init_t; which domain everything else runs in: ps -eo label,args"
+		fi
 		echo "What the policy would refuse: sudo dmesg | grep avc:"
 	fi
 	;;
@@ -269,13 +417,18 @@ relabel)
 	mountpoint -q /sys/fs/selinux || mount -t selinuxfs -o nosuid,noexec selinuxfs /sys/fs/selinux
 	policy_loaded || die "No policy is loaded: sh $0 status says what is missing."
 	[ -f "$contexts" ] || die "There is no $contexts."
+	if [ -z "$(root_label)" ]; then
+		echo "ls shows no labels: coreutils is still built without selinux. The world update first:" >&2
+		world_update >&2
+		exit 1
+	fi
 	# The directories that mounts cover: label them through a second
 	# mount of / that has nothing mounted in it.
 	mnt=$(mktemp -d)
 	trap 'umount "$mnt" 2>/dev/null; rmdir "$mnt" 2>/dev/null' EXIT
 	mount -o bind / "$mnt"
 	findmnt -rno TARGET | while read -r t; do
-		[ "$t" != / ] && [ -d "$mnt$t" ] || continue
+		[ "$t" != / ] && [ "$t" != "$mnt" ] && [ -d "$mnt$t" ] || continue
 		setfiles -r "$mnt" "$contexts" "$mnt$t" || echo "could not label the directory under $t" >&2
 	done
 	umount "$mnt"
@@ -288,13 +441,108 @@ relabel)
 		semanage fcontext --add --seuser system_u --type swapfile_t --ftype f "$f" 2>/dev/null || true
 		echo "swap file $f: swapfile_t"
 	done
+	# A FUSE mount of a user's is closed to root. restorecon says "Could
+	# not stat" for it, labels everything else and fails all the same.
+	# That message for such a mount is let pass, and nothing else.
+	nl='
+'
+	closed=$(findmnt -lno FSTYPE,TARGET | while read -r fs t; do
+		case "$fs" in
+		fuse | fuse.*) [ -e "$t" ] || printf '%s\n' "$t" ;;
+		esac
+	done)
+	expected=
+	[ -z "$closed" ] ||
+		expected=$(printf '%s\n' "$closed" | sed 's/.*/restorecon: Could not stat &: Permission denied./')
 	echo "labelling every file; this takes a while"
-	restorecon -RF -T 0 /
-	echo "Every file is labelled. What the policy would refuse is in the kernel log:"
+	err=$(mktemp)
+	trap 'rm -f "$err"' EXIT
+	rc=0
+	LC_ALL=C restorecon -RF -T 0 / 2>"$err" || rc=$?
+	other=no
+	while IFS= read -r line; do
+		case "$nl$expected$nl" in
+		*"$nl$line$nl"*) ;;
+		*)
+			printf '%s\n' "$line" >&2
+			other=yes
+			;;
+		esac
+	done <"$err"
+	rm -f "$err"
+	trap - EXIT
+	if [ "$rc" -ne 0 ] && { [ "$other" = yes ] || [ -z "$closed" ]; }; then
+		die "restorecon failed (exit status $rc): not every file is labelled."
+	fi
+	if [ -n "$closed" ]; then
+		echo "Every file is labelled, except in the FUSE mounts root cannot enter:"
+		printf '%s\n' "$closed" | sed 's/^/  /'
+	else
+		echo "Every file is labelled."
+	fi
+	echo "What the policy would refuse is in the kernel log:"
 	echo "  dmesg | grep avc:"
+	;;
+s6)
+	need_root
+	[ -d /sys/fs/selinux ] ||
+		die "SELinux is not on in the running kernel: sh $0 status says what is missing."
+	policy_loaded || die "No policy is loaded: sh $0 status says what is missing."
+	command -v semanage >/dev/null && command -v restorecon >/dev/null ||
+		die "semanage and restorecon are missing: sudo sh $0 packages"
+	l=$(root_label)
+	[ "${l#*:root_t}" != "$l" ] || die "The files are not labelled yet: sudo sh $0 relabel"
+	s6_paths || die "/sbin/init is not s6-linux-init's init script, or there is no s6-supervise; this step is for s6-linux-init."
+	case "$init$supervise" in
+	*[!A-Za-z0-9/._-]*) die "$init or $supervise has a character a file context cannot take as it is." ;;
+	esac
+	case "$(sed -n 1p "$rcinit")" in
+	'#!'*/sh | '#!'*'/sh '*) ;;
+	*) die "$rcinit is not a sh script; this step cannot add its line to it." ;;
+	esac
+	s6_contexts | while read -r t k p; do
+		has_context "$t" "$k" "$p" && continue
+		semanage fcontext --add --seuser system_u --type "$t" --ftype "$k" "$p" </dev/null 2>/dev/null ||
+			semanage fcontext --modify --seuser system_u --type "$t" --ftype "$k" "$p" </dev/null
+		echo "file context: $p is $t"
+	done
+	install -m 755 "$here/rc.selinux" "$hook"
+	echo "installed $hook"
+	if ! grep -q " $mark\$" "$rcinit"; then
+		# Second, after the line that names the shell. The line cannot
+		# fail, with or without our script: rc.init stops at a failure.
+		new=$rcinit.wmutils-new
+		cp -p "$rcinit" "$new"
+		{
+			sed -n 1p "$rcinit"
+			echo "[ ! -x $hook ] || $hook || : $mark"
+			sed 1d "$rcinit"
+		} >"$new"
+		if ! sh -n "$new"; then
+			rm -f "$new"
+			die "$rcinit with our line is not a script sh takes; left as it was."
+		fi
+		mv "$new" "$rcinit"
+		echo "$rcinit runs it first"
+	fi
+	restorecon -F "$init" "$supervise"
+	restorecon -RF "$scripts"
+	s6_labelled || die "$init, $supervise and $rcinit did not get their types; undo with: sudo sh $0 s6-undo"
+	echo "$init is init_exec_t; $supervise and $scripts/* are initrc_exec_t"
+	echo "Nothing changes until the next boot. SELinux stays permissive."
+	echo "Next: a reboot. After it: sh $0 status, and"
+	echo "  ps -eo label,args      which domain everything runs in"
+	echo "  sudo dmesg | grep avc: what the policy would refuse"
+	;;
+s6-undo)
+	need_root
+	s6_paths || die "/sbin/init is not s6-linux-init's init script; there is nothing of the s6 step."
+	s6_undo
+	echo "After the next boot everything runs in the kernel's own domain again."
 	;;
 remove)
 	need_root
+	s6_undo
 	if ours; then
 		link=$(cat "$orig")
 		for f in "$profile"/* "$profile"/.[!.]*; do
@@ -339,7 +587,7 @@ remove)
 	echo "The labels stay on the files, where nothing reads them."
 	;;
 *)
-	echo "usage: sh $0 [status|profile|packages|boot|relabel|remove]" >&2
+	echo "usage: sh $0 [status|profile|packages|boot|relabel|s6|s6-undo|remove]" >&2
 	exit 2
 	;;
 esac
