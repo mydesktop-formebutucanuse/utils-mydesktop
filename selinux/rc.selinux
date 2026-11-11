@@ -1,0 +1,24 @@
+#!/bin/sh
+# wmutils: installed as wmutils-selinux beside s6-linux-init's rc.init
+# by selinux/install.sh s6. rc.init runs it first, before s6-rc starts.
+#
+# What OpenRC's and systemd's init do themselves with SELinux, and
+# s6-linux-init does not, before any service runs:
+# - selinuxfs, without which udev and the daemons take SELinux for off and
+#   label nothing they make. The initramfs unmounts its own after loading
+#   the policy.
+# - The label of /run, which s6-linux-init has just mounted, and of the
+#   service directories it copied there. With it, what the services make
+#   in /run gets the types the policy has for it.
+# - The labels of the device nodes the kernel made before udev runs.
+# Nothing here stops the boot: it always ends well, and without SELinux or
+# without a policy it does nothing. See selinux/README.md.
+
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+[ -d /sys/fs/selinux ] || exit 0
+if [ ! -e /sys/fs/selinux/enforce ]; then
+	mount -t selinuxfs -o nosuid,noexec selinuxfs /sys/fs/selinux || exit 0
+fi
+[ -d /sys/fs/selinux/class/file ] || exit 0
+restorecon -RF /run /dev
+exit 0
