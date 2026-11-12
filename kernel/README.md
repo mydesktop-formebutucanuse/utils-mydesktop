@@ -225,11 +225,29 @@ plugging in anything new.
 ### When a new kernel comes
 
 A newer kernel's new drivers build until the list is refreshed, and the
-names it no longer has are ignored. What could go wrong is a driver this
-Mac needs coming to depend on something the list turns off, which
-`olddefconfig` would drop without a word. So once the config is final, the
-hook checks it against required.txt, before anything is compiled, and
-stops the build if an option is off:
+names it no longer has are ignored. Two things can go wrong.
+
+A new driver can call a helper that its own Kconfig entry does not select,
+and that only drivers on the list do. The stock config hides the mistake;
+with the list the build stops at its end, in modpost. That was 7.3.3_p2:
+
+```
+ERROR: modpost: drivers/gpu/drm/panel/panel-chipone-icna35xx.ko: symbol 'drm_dsc_pps_payload_pack' undefined!
+ERROR: modpost: drivers/gpu/drm/panel/panel-novatek-nt36536.ko: symbol 'drm_dsc_pps_payload_pack' undefined!
+```
+
+Two panel drivers new in 7.3, for a handheld and a tablet, use the DSC
+helper (`DRM_DISPLAY_DSC_HELPER`) without selecting it, and every driver
+that does select it is on the list. Such a driver joins the list, as
+these two have; then `sudo sh kernel/install.sh` and the build again. The
+config of 7.3.3_p2, put together as the ebuild does it, has both off with
+the list and no driver left that uses the helper; the build itself has
+not been run with it here.
+
+The other is a driver this Mac needs coming to depend on something the
+list turns off, which `olddefconfig` would drop without a word. So once
+the config is final, the hook checks it against required.txt, before
+anything is compiled, and stops the build if an option is off:
 
 ```
  * wmutils: the kernel config leaves out what this Mac needs:
