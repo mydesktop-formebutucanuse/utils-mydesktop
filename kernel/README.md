@@ -147,6 +147,8 @@ options building modules (2156 files) and 2565 compiled in. Compiling the
 kernel and its modules (`make -j8 all`, as the ebuild does) took 11
 minutes on this M1 Pro; with the stock config it had not finished after
 17, having compiled half again as many files and linked no module yet.
+Those numbers are 7.2.14's. In 7.3.3 the stock config has 4816 and 2960,
+and the list leaves 2013 and 2587.
 
 It is a config fragment: the ebuild merges every `*.config` file in
 `/etc/kernel/config.d` last, and the kernel's `olddefconfig` then drops
@@ -170,7 +172,8 @@ off: nothing is on that is off in the stock config. What goes:
   cards, hardware monitors, regulators and PMICs, real-time clocks, GPIO
   expanders, LED controllers, IIO sensors, touchscreens and keypads, audio
   codecs, video decoders, GPUs, display panels and bridges, watchdogs,
-  flash chips, crypto engines, Wi-Fi chips, CAN controllers, TPMs.
+  flash chips, crypto engines, Wi-Fi chips, CAN controllers, TPMs, and
+  the calls into the firmware of Qualcomm SoCs.
 
 What stays:
 
@@ -239,10 +242,7 @@ ERROR: modpost: drivers/gpu/drm/panel/panel-novatek-nt36536.ko: symbol 'drm_dsc_
 Two panel drivers new in 7.3, for a handheld and a tablet, use the DSC
 helper (`DRM_DISPLAY_DSC_HELPER`) without selecting it, and every driver
 that does select it is on the list. Such a driver joins the list, as
-these two have; then `sudo sh kernel/install.sh` and the build again. The
-config of 7.3.3_p2, put together as the ebuild does it, has both off with
-the list and no driver left that uses the helper; the build itself has
-not been run with it here.
+these two have; then `sudo sh kernel/install.sh` and the build again.
 
 The other is a driver this Mac needs coming to depend on something the
 list turns off, which `olddefconfig` would drop without a word. So once
@@ -266,6 +266,43 @@ sudo env WMUTILS_UNCHECKED=1 emerge --oneshot sys-kernel/asahi-kernel
 An option in required.txt that the new kernel does not have at all
 (renamed, say) only gets a warning: check that its module still builds,
 and update required.txt.
+
+### Refreshing the list
+
+The list was made for 7.2.14_p1 and refreshed for 7.3.3_p2. A refresh
+starts from the config of the old kernel and of the new one, each put
+together as the ebuild does it (Fedora's config, the Gentoo and Asahi
+fragments, the list, `olddefconfig`); for 7.2.14 that comes out as the
+running kernel's `/proc/config.gz`, option for option.
+
+- Every option that is on in the new kernel with the list, and was not in
+  the old one, is looked at. For 7.3.3 that was 83. 30 of them went on the
+  list, by the rules above, and with the two panels that did not build
+  the list has 32 new lines; they and what depends on them turn 46 of the
+  83 off:
+  - chips on I2C and SPI: sensors and converters, two chargers, an LED and
+    a backlight controller, a haptic driver, three audio codecs;
+  - five more display panels;
+  - a Wi-Fi chip on SDIO and one on PCI, and a RAID card;
+  - the calls into the firmware of Qualcomm SoCs, which 7.3 offers on
+    every arm64 kernel and Fedora compiles in. In 7.2 only Qualcomm's own
+    drivers turned them on.
+- The other 37 stay: two HID drivers, two Ethernet PHYs and the library
+  for MCTP over USB, which a USB device can need; generic parts of the
+  kernel (crypto, memory management, IOMMU page tables, Rust bindings,
+  options of Landlock, AppArmor, EROFS and the like); two workarounds for
+  errata of other CPUs, like the ones already there; and a serial card on
+  PCIe, as the list leaves serial ports alone.
+- What the list turns off without naming it, because it depends on
+  something named, is compared between the two kernels. 7.3.3 has 26 such
+  options more: tests, PCI Ethernet, HD Audio and SoundWire parts,
+  hardware monitors and camera sensors, whose menus are on the list, and
+  the USB audio offload to Qualcomm's sound DSP. Of the options compiled
+  into the stock kernel, 373 end up off: the 368 of 7.2.14 and five of
+  the Qualcomm firmware calls.
+- Nothing is on that is off in the stock config, and the 115 options in
+  required.txt keep their stock values.
+- This directory's four patches fit 7.3.3_p2 as they are.
 
 ### Turning something back on
 
