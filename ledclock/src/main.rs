@@ -4,9 +4,10 @@
 //!
 //! The window has no title bar, is on every workspace, takes no focus and
 //! stays under the other windows (or over them with -above). The frame and
-//! the panel are computed for the size of the window (src/face.rs), so the
-//! clock is as sharp at Window Maker's GUI scale factor as at 1; the digits
-//! are drawn by Xft over it.
+//! the panel are computed for the size of the window (src/face.rs), and so
+//! are the digits, of seven segments each (src/segments.rs): the clock is
+//! as sharp at Window Maker's GUI scale factor as at 1. AM and PM are
+//! drawn by Xft.
 //!
 //! The pointer moves the clock, and makes it larger or smaller by a
 //! corner, in its proportions. Window Maker does neither for a window of
@@ -18,6 +19,7 @@
 //! or the clock was set.
 
 mod face;
+mod segments;
 mod xlib;
 
 use std::ffi::CString;
@@ -31,19 +33,18 @@ const USAGE: &str =
     "usage: ledclock [-24] [-above] [-geometry +X+Y] [-width PIXELS] [-color RRGGBB] [-font FONT]";
 /// The LEDs of the design.
 const DEFAULT_COLOR: u32 = 0xff0000;
-/// The digits of the design are narrow ones with a foot under the 1, as
-/// DejaVu Sans Condensed has them; without that font, the screen's
-/// sans-serif one.
-const DEFAULT_FONT: &str = "DejaVu Sans Condensed,sans-serif";
-/// AM and PM are in a font of their own, smaller.
-const MARKER_FONT: &str = "DejaVu Sans Mono,monospace";
-/// In pixels of the design (src/face.rs): the height of a digit and of the
-/// letters of AM, the line they stand on, and the space between AM and the
+/// AM and PM are letters, as the design has them; without that font, the
+/// screen's monospace one. The digits are not in a font (src/segments.rs).
+const DEFAULT_FONT: &str = "DejaVu Sans Mono,monospace";
+/// In pixels of the design (src/face.rs): the height of the letters of AM,
+/// the line they and the digits stand on, and the space between AM and the
 /// digits.
-const DIGIT_HEIGHT: f64 = 39.0;
 const MARKER_HEIGHT: f64 = 17.0;
 const BASELINE: f64 = 63.0;
 const MARKER_GAP: f64 = 12.0;
+/// How much of the colour a segment has that is not lit: it shows, as on a
+/// display that is off.
+const UNLIT: f64 = 0.12;
 /// The range WINGs accepts for GSScaleFactor.
 const MIN_FACTOR: f64 = 0.5;
 const MAX_FACTOR: f64 = 8.0;
@@ -189,27 +190,27 @@ fn window_size(width: u32) -> (i32, i32) {
 }
 
 /// What the clock shows at `hour`:`minute`: AM or PM, unless the clock
-/// counts 24 hours, and the digits.
-fn clock_text(hour: i32, minute: i32, hours24: bool) -> (Option<&'static str>, String) {
+/// counts 24 hours, and the four digits.
+fn clock_text(hour: i32, minute: i32, hours24: bool) -> (Option<&'static str>, [u8; 4]) {
+    let digits = |hour: i32| [hour / 10, hour % 10, minute / 10, minute % 10].map(|d| d as u8);
     if hours24 {
-        return (None, format!("{hour:02}:{minute:02}"));
+        return (None, digits(hour));
     }
     let marker = if hour < 12 { "AM" } else { "PM" };
     let hour = match hour % 12 {
         0 => 12,
         h => h,
     };
-    (Some(marker), format!("{hour:02}:{minute:02}"))
+    (Some(marker), digits(hour))
 }
 
 /// Where AM and the digits start, from the left of a window `width` pixels
 /// wide: the two together are in the middle of the panel. `marker` is the
-/// width of AM, 0 without it; a digit takes `cell` pixels and the colon
-/// `colon`.
-fn text_origins(width: i32, marker: i32, cell: i32, colon: i32) -> (i32, i32) {
+/// width of AM, 0 without it.
+fn text_origins(width: i32, marker: i32) -> (i32, i32) {
     let scale = width as f64 / face::WIDTH;
     let gap = if marker > 0 { (MARKER_GAP * scale).round() as i32 } else { 0 };
-    let total = marker + gap + 4 * cell + colon;
+    let total = marker + gap + (segments::WIDTH * scale).round() as i32;
     let middle = (face::PANEL_LEFT + face::PANEL_RIGHT) / 2.0 * scale;
     let start = (middle - total as f64 / 2.0).round() as i32;
     (start, start + marker + gap)
@@ -381,7 +382,9 @@ struct Clock {
     gc: *mut Gc,
     draw: *mut XftDraw,
     fg: XftColor,
-    /// The font of the digits, as -font names it.
+    /// The colour of the LEDs: red, green and blue.
+    led: [f64; 3],
+    /// The font of AM and PM, as -font names it.
     family: String,
     hours24: bool,
     /// The cursor over the clock while it is moved, the ones over its
@@ -399,15 +402,13 @@ struct Clock {
     /// The edges of the frame are not smoothed: the pointer is changing the
     /// size, and the picture is computed at every size on the way.
     rough: bool,
-    /// The frame and the panel.
+    /// The frame and the panel: the colour of every pixel, row by row, and
+    /// the same on a pixmap.
+    colors: Vec<[u8; 3]>,
     back: Pixmap,
     /// The same with the time on it: what the window shows.
     pixmap: Pixmap,
-    digits: *mut XftFont,
     marker: *mut XftFont,
-    /// The width a digit takes, the widest of the ten.
-    cell: i32,
-    colon: i32,
     /// The width of AM or PM; 0 on a clock of 24 hours.
     marker_width: i32,
     baseline: i32,
@@ -458,7 +459,13 @@ impl Clock {
         // two pixels; at another size the edges are smoothed.
         let whole = (self.width as f64 / face::WIDTH).fract() == 0.0;
         self.rough = !whole && !smooth;
-        let colors = face::render(w, h, if whole || !smooth { 1 } else { 3 });
+        self.colors = face::render(w, h, if whole || !smooth { 1 } else { 3 });
+        self.put_image(self.back, &self.colors, 0, 0, w, h);
+    }
+
+    /// Puts a picture `w` pixels wide and `h` high, row by row in `colors`,
+    /// at `x`, `y` of a pixmap.
+    fn put_image(&self, to: Pixmap, colors: &[[u8; 3]], x: usize, y: usize, w: usize, h: usize) {
         // SAFETY: the image is created without data, given `pixels` for the
         // time of XPutImage, and freed without it.
         unsafe {
@@ -486,22 +493,22 @@ impl Clock {
             // for a server of the other one.
             (*image).byte_order = if cfg!(target_endian = "big") { MSB_FIRST } else { LSB_FIRST };
             (*image).data = pixels.as_mut_ptr() as *mut c_char;
-            XPutImage(self.dpy, self.back, self.gc, image, 0, 0, 0, 0, w as c_uint, h as c_uint);
+            XPutImage(self.dpy, to, self.gc, image, 0, 0, x as c_int, y as c_int, w as c_uint, h as c_uint);
             (*image).data = ptr::null_mut();
             XDestroyImage(image);
         }
     }
 
-    /// Makes the pixmaps, the fonts and the picture of the frame for a
+    /// Makes the pixmaps, the font and the picture of the frame for a
     /// window of this size, in the place of the ones for the size before.
     fn fit(&mut self, width: i32, height: i32, smooth: bool) {
         let (dpy, screen) = (self.dpy, self.screen);
         let scale = height as f64 / face::HEIGHT;
-        // SAFETY: the pixmaps and fonts of the size before are freed once,
-        // after the first call only, and replaced before anything draws.
+        // SAFETY: the pixmaps and the font of the size before are freed
+        // once, after the first call only, and replaced before anything
+        // draws.
         unsafe {
-            if !self.digits.is_null() {
-                XftFontClose(dpy, self.digits);
+            if !self.marker.is_null() {
                 XftFontClose(dpy, self.marker);
                 XFreePixmap(dpy, self.back);
                 XFreePixmap(dpy, self.pixmap);
@@ -511,12 +518,8 @@ impl Clock {
             XftDrawChange(self.draw, self.pixmap);
         }
         (self.width, self.height) = (width, height);
-        // A digit that is flat at both ends gives the height.
-        self.digits = Clock::open_font(dpy, screen, &self.family, "1", DIGIT_HEIGHT * scale);
-        self.marker = Clock::open_font(dpy, screen, MARKER_FONT, "M", MARKER_HEIGHT * scale);
-        self.cell =
-            (b'0'..=b'9').map(|d| Clock::advance(dpy, self.digits, &(d as char).to_string())).max().unwrap_or(0);
-        self.colon = Clock::advance(dpy, self.digits, ":");
+        // A letter that is flat at both ends gives the height.
+        self.marker = Clock::open_font(dpy, screen, &self.family, "M", MARKER_HEIGHT * scale);
         self.marker_width = if self.hours24 {
             0
         } else {
@@ -606,6 +609,7 @@ impl Clock {
                 gc,
                 draw,
                 fg,
+                led: [16, 8, 0].map(|shift| ((opts.color >> shift) & 0xff) as f64),
                 family: opts.font.clone(),
                 hours24: opts.hours24,
                 fleur: XCreateFontCursor(dpy, XC_FLEUR),
@@ -617,12 +621,10 @@ impl Clock {
                 width,
                 height,
                 rough: false,
+                colors: Vec::new(),
                 back: 0,
                 pixmap: 0,
-                digits: ptr::null_mut(),
                 marker: ptr::null_mut(),
-                cell: 0,
-                colon: 0,
                 marker_width: 0,
                 baseline: 0,
             };
@@ -689,31 +691,50 @@ impl Clock {
         }
     }
 
-    fn text(&self, font: *mut XftFont, s: &str, x: i32) {
-        // SAFETY: valid draw, colour and font; `s` is UTF-8 of the given
-        // length.
-        unsafe { XftDrawStringUtf8(self.draw, &self.fg, font, x, self.baseline, s.as_ptr(), s.len() as c_int) };
+    /// Puts the display of segments, showing `digits`, on the panel:
+    /// `left` is where it starts, standing on the baseline. The segments
+    /// that are lit have the colour of the LEDs; the others have a little
+    /// of it, over the panel.
+    fn put_digits(&self, left: i32, digits: [u8; 4]) {
+        let scale = self.height as f64 / face::HEIGHT;
+        let top = self.baseline as f64 - segments::HEIGHT * scale;
+        // The pixels the display can touch: it leans, and an edge of it
+        // can be in the middle of a pixel.
+        let lean = (segments::LEAN * scale).ceil() as i32 + 1;
+        let (x0, x1) = (left - lean, left + (segments::WIDTH * scale).ceil() as i32 + lean);
+        let (y0, y1) = (top.floor() as i32 - 1, self.baseline + 1);
+        let (x0, x1) = (x0.clamp(0, self.width) as usize, x1.clamp(0, self.width) as usize);
+        let (y0, y1) = (y0.clamp(0, self.height) as usize, y1.clamp(0, self.height) as usize);
+        if x0 == x1 || y0 == y1 {
+            return;
+        }
+        let mut colors = Vec::with_capacity((x1 - x0) * (y1 - y0));
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let (x, y) = ((px as f64 + 0.5 - left as f64) / scale, (py as f64 + 0.5 - top) / scale);
+                let (lit, unlit) = segments::cover(x, y, 1.0 / scale, digits);
+                let led = lit + (1.0 - lit) * UNLIT * unlit;
+                let under = self.colors[py * self.width as usize + px];
+                colors.push([0, 1, 2].map(|k| (under[k] as f64 + (self.led[k] - under[k] as f64) * led).round() as u8));
+            }
+        }
+        self.put_image(self.pixmap, &colors, x0, y0, x1 - x0, y1 - y0);
     }
 
     /// Draws the time over the frame and the panel.
-    fn paint(&self, marker: Option<&str>, digits: &str) {
+    fn paint(&self, marker: Option<&str>, digits: [u8; 4]) {
         let (w, h) = (self.width as c_uint, self.height as c_uint);
         // SAFETY: valid display, pixmaps and GC.
         unsafe { XCopyArea(self.dpy, self.back, self.pixmap, self.gc, 0, 0, w, h, 0, 0) };
-        let (marker_x, mut x) = text_origins(self.width, self.marker_width, self.cell, self.colon);
-        if let Some(marker) = marker {
-            self.text(self.marker, marker, marker_x);
+        let (marker_x, digits_x) = text_origins(self.width, self.marker_width);
+        if let Some(s) = marker {
+            // SAFETY: valid draw, colour and font; `s` is UTF-8 of the
+            // given length.
+            unsafe {
+                XftDrawStringUtf8(self.draw, &self.fg, self.marker, marker_x, self.baseline, s.as_ptr(), s.len() as c_int)
+            };
         }
-        // Every digit in the middle of a place of the same width: the
-        // others do not move when one changes.
-        let mut utf8 = [0; 4];
-        for c in digits.chars() {
-            let s = &*c.encode_utf8(&mut utf8);
-            let advance = Clock::advance(self.dpy, self.digits, s);
-            let place = if c.is_ascii_digit() { self.cell } else { advance };
-            self.text(self.digits, s, x + (place - advance) / 2);
-            x += place;
-        }
+        self.put_digits(digits_x, digits);
         self.show();
     }
 
@@ -757,7 +778,7 @@ fn main() {
         XFlush(clock.dpy);
     }
 
-    let mut shown: Option<(Option<&str>, String)> = None;
+    let mut shown: Option<(Option<&str>, [u8; 4])> = None;
     // The window has a new size: the time is painted again.
     let mut resized = false;
     let mut drag: Option<Drag> = None;
@@ -768,7 +789,7 @@ fn main() {
         let (hour, minute) = local_time(now);
         let text = clock_text(hour, minute, opts.hours24);
         if resized || shown.as_ref() != Some(&text) {
-            clock.paint(text.0, &text.1);
+            clock.paint(text.0, text.1);
             shown = Some(text);
             resized = false;
         }
@@ -879,12 +900,12 @@ mod tests {
 
     #[test]
     fn twelve_hours() {
-        assert_eq!(clock_text(7, 15, false), (Some("AM"), "07:15".to_string()));
-        assert_eq!(clock_text(0, 5, false), (Some("AM"), "12:05".to_string()));
-        assert_eq!(clock_text(12, 0, false), (Some("PM"), "12:00".to_string()));
-        assert_eq!(clock_text(23, 59, false), (Some("PM"), "11:59".to_string()));
-        assert_eq!(clock_text(0, 5, true), (None, "00:05".to_string()));
-        assert_eq!(clock_text(19, 15, true), (None, "19:15".to_string()));
+        assert_eq!(clock_text(7, 15, false), (Some("AM"), [0, 7, 1, 5]));
+        assert_eq!(clock_text(0, 5, false), (Some("AM"), [1, 2, 0, 5]));
+        assert_eq!(clock_text(12, 0, false), (Some("PM"), [1, 2, 0, 0]));
+        assert_eq!(clock_text(23, 59, false), (Some("PM"), [1, 1, 5, 9]));
+        assert_eq!(clock_text(0, 5, true), (None, [0, 0, 0, 5]));
+        assert_eq!(clock_text(19, 15, true), (None, [1, 9, 1, 5]));
     }
 
     #[test]
@@ -897,14 +918,15 @@ mod tests {
     #[test]
     fn text_in_the_middle() {
         // The panel of the design is 15..258: its middle is 136.5.
-        let (marker, digits) = text_origins(274, 26, 31, 16);
+        // The display of the digits is 118 wide.
+        let (marker, digits) = text_origins(274, 26);
         assert_eq!(digits - marker, 26 + 12);
-        let total = 26 + 12 + 4 * 31 + 16;
+        let total = 26 + 12 + 118;
         assert!((marker as f64 + total as f64 / 2.0 - 136.5).abs() <= 0.5);
         // Without AM the digits are in the middle by themselves.
-        let (marker, digits) = text_origins(548, 0, 62, 32);
+        let (marker, digits) = text_origins(548, 0);
         assert_eq!(marker, digits);
-        assert_eq!(digits, 273 - (4 * 62 + 32) / 2);
+        assert_eq!(digits, 273 - 118);
     }
 
     #[test]

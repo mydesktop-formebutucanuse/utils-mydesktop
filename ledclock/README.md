@@ -7,6 +7,11 @@ frame lit from the top left.
 AM 07:15
 ```
 
+The digits are those of an LED display: seven segments each, leaning a
+little to the right, with the two dots of a colon between the hours and the
+minutes. Every segment is there all the time, as on a display that shows
+88:88: the ones that are lit are red, the others show faintly on the panel.
+
 It is a window of its own, three times as wide as it is high, and not a
 dock app. It has no title bar and no border, is on every workspace, takes no
 focus, has no application icon and is not in the window list. It stays
@@ -30,8 +35,8 @@ ledclock -24 -above &           # 19:15, over the other windows
 | `-width PIXELS` | The width of the window, 60 to 8192; the height is 90/274 of it. Without it: the width the pointer gave it; the first time, 274 pixels times Window Maker's GUI scale factor (548x180 at a factor of 2) |
 | `-24` | 24 hours, without AM and PM |
 | `-above` | Over the other windows instead of under them |
-| `-color RRGGBB` | The colour of the time (`ff0000`) |
-| `-font FONT` | The font of the digits: a family or a Fontconfig pattern, without a size (`"Liberation Sans:bold"`) |
+| `-color RRGGBB` | The colour of the LEDs (`ff0000`) |
+| `-font FONT` | The font of AM and PM: a family or a Fontconfig pattern, without a size (`"Liberation Mono:bold"`) |
 
 Window Maker does not move or resize a window of this kind, with Alt and
 the mouse or otherwise: ledclock does both itself. It keeps the whole clock
@@ -47,16 +52,14 @@ have the first place and size again.
 The scale factor is the one Window Maker and [scd](../scd) use: the
 environment variable `GS_SCALE_FACTOR`, or else `GSScaleFactor` in
 `~/GNUstep/Defaults/WMGLOBAL` (in `$WMAKER_USER_ROOT/Defaults/WMGLOBAL` when
-that variable is set). It is read when ledclock starts. The frame and the
-panel are computed for the size of the window, not enlarged from a picture,
-and the digits are drawn by Xft at that size: the clock is as sharp at 2 as
-at 1, and at any size it is dragged to.
+that variable is set). It is read when ledclock starts. The frame, the
+panel and the segments are computed for the size of the window, not enlarged
+from a picture: the clock is as sharp at 2 as at 1, and at any size it is
+dragged to.
 
-The digits are in DejaVu Sans Condensed and AM and PM in DejaVu Sans Mono
-when those fonts are installed (`media-fonts/dejavu` on Gentoo): narrow
-digits with a foot under the 1, as the design this clock was drawn from has
-them. Without them the digits are in the system's sans-serif font and AM and
-PM in its monospace one.
+AM and PM are letters, drawn by Xft: in DejaVu Sans Mono when that font is
+installed (`media-fonts/dejavu` on Gentoo), as the design this clock was
+drawn from has them, and in the system's monospace font without it.
 
 ledclock wakes once a minute, at the minute. Its timer follows the wall
 clock, so the time is right at once after the machine was suspended or the
