@@ -7,7 +7,8 @@
 //! the panel are computed for the size of the window (src/face.rs), and so
 //! are the digits, of seven segments each (src/segments.rs): the clock is
 //! as sharp at Window Maker's GUI scale factor as at 1. AM and PM are
-//! drawn by Xft.
+//! drawn by Xft, and so is the charge of the battery, in percent, over
+//! them.
 //!
 //! The pointer moves the clock, and makes it larger or smaller by a
 //! corner, in its proportions. Window Maker does neither for a window of
@@ -45,6 +46,16 @@ const MARKER_GAP: f64 = 12.0;
 /// How much of the colour a segment has that is not lit: it shows, as on a
 /// display that is off.
 const UNLIT: f64 = 0.12;
+/// Where the batteries are.
+const POWER_SUPPLIES: &str = "/sys/class/power_supply";
+/// What the eye takes for the margins on the two sides of the time, in
+/// pixels of the design. The frame's shadow lies on the left of the panel,
+/// which looks as if it began this much further in.
+const SHADOW: f64 = 3.0;
+/// The charge of the battery is a longer line than AM under it, and the
+/// eye puts the left edge of the two between their ends: this much of the
+/// way from the end of the longer one.
+const RAGGED: f64 = 0.3;
 /// The range WINGs accepts for GSScaleFactor.
 const MIN_FACTOR: f64 = 0.5;
 const MAX_FACTOR: f64 = 8.0;
@@ -204,16 +215,53 @@ fn clock_text(hour: i32, minute: i32, hours24: bool) -> (Option<&'static str>, [
     (Some(marker), digits(hour))
 }
 
-/// Where AM and the digits start, from the left of a window `width` pixels
-/// wide: the two together are in the middle of the panel. `marker` is the
-/// width of AM, 0 without it.
-fn text_origins(width: i32, marker: i32) -> (i32, i32) {
+/// The charge of a power supply, in percent, from what its `type`, `scope`
+/// and `capacity` files say: of a battery, and not of the battery of a
+/// mouse or a keyboard.
+fn battery_charge(kind: Option<&str>, scope: Option<&str>, capacity: Option<&str>) -> Option<u8> {
+    if kind? != "Battery" || scope == Some("Device") {
+        return None;
+    }
+    capacity?.parse::<u8>().ok().map(|percent| percent.min(100))
+}
+
+/// The charge of the machine's battery, in percent; None on a machine
+/// without one.
+fn battery() -> Option<u8> {
+    let mut supplies: Vec<PathBuf> = fs::read_dir(POWER_SUPPLIES).ok()?.flatten().map(|entry| entry.path()).collect();
+    supplies.sort();
+    supplies.iter().find_map(|supply| {
+        let read = |name: &str| fs::read_to_string(supply.join(name)).ok();
+        let (kind, scope, capacity) = (read("type"), read("scope"), read("capacity"));
+        fn trimmed(s: &Option<String>) -> Option<&str> {
+            s.as_deref().map(str::trim)
+        }
+        battery_charge(trimmed(&kind), trimmed(&scope), trimmed(&capacity))
+    })
+}
+
+/// How far inside its column of letters the eye sees the left edge of
+/// them. `longer` and `shorter` are the widths of the two lines, the
+/// charge of the battery and AM under it, and `bearing` is the empty part
+/// of the first letter's width, on its left.
+fn inset(longer: i32, shorter: i32, bearing: i32) -> f64 {
+    let ragged = if shorter > 0 { RAGGED * (longer - shorter) as f64 } else { 0.0 };
+    bearing as f64 + ragged
+}
+
+/// Where the letters and the digits start, from the left of a window
+/// `width` pixels wide: the two together are in the middle of the panel,
+/// with margins that look the same on both sides. `letters` is the width
+/// of the column of letters on the left of the digits, AM and the charge
+/// of the battery, 0 without them; `inset` is how far inside that column
+/// the letters are seen to begin.
+fn text_origins(width: i32, letters: i32, inset: f64) -> (i32, i32) {
     let scale = width as f64 / face::WIDTH;
-    let gap = if marker > 0 { (MARKER_GAP * scale).round() as i32 } else { 0 };
-    let total = marker + gap + (segments::WIDTH * scale).round() as i32;
-    let middle = (face::PANEL_LEFT + face::PANEL_RIGHT) / 2.0 * scale;
-    let start = (middle - total as f64 / 2.0).round() as i32;
-    (start, start + marker + gap)
+    let gap = if letters > 0 { (MARKER_GAP * scale).round() as i32 } else { 0 };
+    let total = letters + gap + (segments::WIDTH * scale).round() as i32;
+    let middle = (face::PANEL_LEFT + SHADOW + face::PANEL_RIGHT) / 2.0 * scale;
+    let start = (middle - (inset + total as f64) / 2.0).round() as i32;
+    (start, start + letters + gap)
 }
 
 fn atom(dpy: *mut Display, name: &str) -> Atom {
@@ -411,7 +459,13 @@ struct Clock {
     marker: *mut XftFont,
     /// The width of AM or PM; 0 on a clock of 24 hours.
     marker_width: i32,
+    /// The empty part of the width of a digit of the charge, on its left.
+    bearing: i32,
+    /// The line the digits and AM stand on, and the one above it, where
+    /// the letters reach as high as the digits: the charge of the battery
+    /// is there when AM is under it.
     baseline: i32,
+    upper: i32,
 }
 
 impl Clock {
@@ -420,6 +474,14 @@ impl Clock {
         // SAFETY: valid display and font; `s` is UTF-8 of the given length.
         unsafe { XftTextExtentsUtf8(dpy, font, s.as_ptr(), s.len() as c_int, &mut g) };
         g.x_off as i32
+    }
+
+    /// The empty part of the width of the first letter of `s`, on its left.
+    fn bearing(dpy: *mut Display, font: *mut XftFont, s: &str) -> i32 {
+        let mut g = XGlyphInfo::default();
+        // SAFETY: valid display and font; `s` is UTF-8 of the given length.
+        unsafe { XftTextExtentsUtf8(dpy, font, s.as_ptr(), s.len() as c_int, &mut g) };
+        -(g.x as i32)
     }
 
     /// The font `family` at the size where `sample` is `height` pixels
@@ -525,7 +587,11 @@ impl Clock {
         } else {
             Clock::advance(dpy, self.marker, "AM").max(Clock::advance(dpy, self.marker, "PM"))
         };
+        // Of the same digit for every charge: the time does not move by a
+        // pixel when the charge goes from 70 to 69.
+        self.bearing = Clock::bearing(dpy, self.marker, "0");
         self.baseline = (BASELINE * scale).round() as i32;
+        self.upper = ((BASELINE - segments::HEIGHT + MARKER_HEIGHT) * scale).round() as i32;
         self.put_face(smooth);
     }
 
@@ -626,7 +692,9 @@ impl Clock {
                 pixmap: 0,
                 marker: ptr::null_mut(),
                 marker_width: 0,
+                bearing: 0,
                 baseline: 0,
+                upper: 0,
             };
             clock.fit(width, height, true);
             clock.set_size_hints();
@@ -721,18 +789,34 @@ impl Clock {
         self.put_image(self.pixmap, &colors, x0, y0, x1 - x0, y1 - y0);
     }
 
-    /// Draws the time over the frame and the panel.
-    fn paint(&self, marker: Option<&str>, digits: [u8; 4]) {
+    /// Draws letters that end at `right`, standing on the line `y`.
+    fn letters(&self, s: &str, right: i32, y: i32) {
+        let x = right - Clock::advance(self.dpy, self.marker, s);
+        // SAFETY: valid draw, colour and font; `s` is UTF-8 of the given
+        // length.
+        unsafe { XftDrawStringUtf8(self.draw, &self.fg, self.marker, x, y, s.as_ptr(), s.len() as c_int) };
+    }
+
+    /// Draws the time over the frame and the panel, and on the left of it
+    /// the charge of the battery, over AM or PM.
+    fn paint(&self, marker: Option<&str>, digits: [u8; 4], charge: Option<u8>) {
         let (w, h) = (self.width as c_uint, self.height as c_uint);
         // SAFETY: valid display, pixmaps and GC.
         unsafe { XCopyArea(self.dpy, self.back, self.pixmap, self.gc, 0, 0, w, h, 0, 0) };
-        let (marker_x, digits_x) = text_origins(self.width, self.marker_width);
-        if let Some(s) = marker {
-            // SAFETY: valid draw, colour and font; `s` is UTF-8 of the
-            // given length.
-            unsafe {
-                XftDrawStringUtf8(self.draw, &self.fg, self.marker, marker_x, self.baseline, s.as_ptr(), s.len() as c_int)
-            };
+        let charge = charge.map(|percent| format!("{percent}%"));
+        // The column is as wide as the longer of its two lines, and the
+        // margin on its left is measured from where the eye sees them
+        // begin.
+        let charge_width = charge.as_ref().map_or(0, |s| Clock::advance(self.dpy, self.marker, s));
+        let column = self.marker_width.max(charge_width);
+        let seen = if charge.is_some() { inset(column, self.marker_width.min(charge_width), self.bearing) } else { 0.0 };
+        let (start, digits_x) = text_origins(self.width, column, seen);
+        if let Some(marker) = marker {
+            self.letters(marker, start + column, self.baseline);
+        }
+        if let Some(charge) = &charge {
+            let line = if marker.is_some() { self.upper } else { self.baseline };
+            self.letters(charge, start + column, line);
         }
         self.put_digits(digits_x, digits);
         self.show();
@@ -778,7 +862,7 @@ fn main() {
         XFlush(clock.dpy);
     }
 
-    let mut shown: Option<(Option<&str>, [u8; 4])> = None;
+    let mut shown: Option<(Option<&str>, [u8; 4], Option<u8>)> = None;
     // The window has a new size: the time is painted again.
     let mut resized = false;
     let mut drag: Option<Drag> = None;
@@ -787,9 +871,16 @@ fn main() {
         // SAFETY: time() accepts a null pointer.
         let now = unsafe { time(ptr::null_mut()) };
         let (hour, minute) = local_time(now);
-        let text = clock_text(hour, minute, opts.hours24);
+        let (marker, digits) = clock_text(hour, minute, opts.hours24);
+        // The battery is read again when the minute changes, not for every
+        // move of the pointer over the clock.
+        let charge = match &shown {
+            Some(shown) if (shown.0, shown.1) == (marker, digits) => shown.2,
+            _ => battery(),
+        };
+        let text = (marker, digits, charge);
         if resized || shown.as_ref() != Some(&text) {
-            clock.paint(text.0, text.1);
+            clock.paint(marker, digits, charge);
             shown = Some(text);
             resized = false;
         }
@@ -910,23 +1001,52 @@ mod tests {
 
     #[test]
     fn sizes() {
-        assert_eq!(window_size(274), (274, 90));
-        assert_eq!(window_size(548), (548, 180));
-        assert_eq!(window_size(411), (411, 135));
+        assert_eq!(window_size(302), (302, 90));
+        assert_eq!(window_size(604), (604, 180));
+        assert_eq!(window_size(453), (453, 135));
     }
 
     #[test]
     fn text_in_the_middle() {
-        // The panel of the design is 15..258: its middle is 136.5.
+        // The panel is 15..286, and with the shadow on its left it looks
+        // like 18..286: the middle of that is 152.
         // The display of the digits is 118 wide.
-        let (marker, digits) = text_origins(274, 26);
-        assert_eq!(digits - marker, 26 + 12);
-        let total = 26 + 12 + 118;
-        assert!((marker as f64 + total as f64 / 2.0 - 136.5).abs() <= 0.5);
-        // Without AM the digits are in the middle by themselves.
-        let (marker, digits) = text_origins(548, 0);
-        assert_eq!(marker, digits);
-        assert_eq!(digits, 273 - 118);
+        let (letters, digits) = text_origins(302, 56, 0.0);
+        assert_eq!(digits - letters, 56 + 12);
+        assert_eq!((letters, digits + 118), (59, 245));
+        // The margins: 41 on both sides.
+        assert_eq!((letters - 18, 286 - (digits + 118)), (41, 41));
+        // Letters that are seen to begin 6 pixels inside their column are
+        // 3 further to the left: 44 from where they begin, as on the right.
+        let (letters, digits) = text_origins(302, 56, 6.0);
+        assert_eq!((letters + 6 - 18, 286 - (digits + 118)), (44, 44));
+        // Without letters the digits are in the middle by themselves.
+        let (letters, digits) = text_origins(604, 0, 0.0);
+        assert_eq!(letters, digits);
+        assert_eq!(digits, 304 - 118);
+    }
+
+    #[test]
+    fn insets() {
+        // One line: only the empty part of its first letter.
+        assert_eq!(inset(45, 0, 2), 2.0);
+        // Two lines of the same length.
+        assert_eq!(inset(30, 30, 2), 2.0);
+        // AM is 15 shorter than the charge over it: 0.3 of that.
+        assert_eq!(inset(45, 30, 2), 6.5);
+    }
+
+    #[test]
+    fn batteries() {
+        assert_eq!(battery_charge(Some("Battery"), Some("System"), Some("75")), Some(75));
+        assert_eq!(battery_charge(Some("Battery"), None, Some("100")), Some(100));
+        assert_eq!(battery_charge(Some("Battery"), None, Some("103")), Some(100));
+        // The adapter, a mouse, and a battery that does not say.
+        assert_eq!(battery_charge(Some("Mains"), None, None), None);
+        assert_eq!(battery_charge(Some("Battery"), Some("Device"), Some("40")), None);
+        assert_eq!(battery_charge(Some("Battery"), Some("System"), None), None);
+        assert_eq!(battery_charge(Some("Battery"), Some("System"), Some("full")), None);
+        assert_eq!(battery_charge(None, None, Some("75")), None);
     }
 
     #[test]
@@ -940,17 +1060,17 @@ mod tests {
     #[test]
     fn grips() {
         // At twice the design a corner reaches 40 pixels in.
-        assert_eq!(grip_at(548, 180, 0, 0), Grip::Corner { left: true, top: true });
-        assert_eq!(grip_at(548, 180, 39, 39), Grip::Corner { left: true, top: true });
-        assert_eq!(grip_at(548, 180, 40, 39), Grip::Body);
-        assert_eq!(grip_at(548, 180, 39, 40), Grip::Body);
-        assert_eq!(grip_at(548, 180, 547, 0), Grip::Corner { left: false, top: true });
-        assert_eq!(grip_at(548, 180, 10, 179), Grip::Corner { left: true, top: false });
-        assert_eq!(grip_at(548, 180, 508, 140), Grip::Corner { left: false, top: false });
-        assert_eq!(grip_at(548, 180, 274, 90), Grip::Body);
+        assert_eq!(grip_at(604, 180, 0, 0), Grip::Corner { left: true, top: true });
+        assert_eq!(grip_at(604, 180, 39, 39), Grip::Corner { left: true, top: true });
+        assert_eq!(grip_at(604, 180, 40, 39), Grip::Body);
+        assert_eq!(grip_at(604, 180, 39, 40), Grip::Body);
+        assert_eq!(grip_at(604, 180, 603, 0), Grip::Corner { left: false, top: true });
+        assert_eq!(grip_at(604, 180, 10, 179), Grip::Corner { left: true, top: false });
+        assert_eq!(grip_at(604, 180, 564, 140), Grip::Corner { left: false, top: false });
+        assert_eq!(grip_at(604, 180, 302, 90), Grip::Body);
         // The smallest clock still has a middle to move it by.
-        assert_eq!(grip_at(60, 20, 30, 10), Grip::Body);
-        assert_eq!(grip_at(60, 20, 3, 3), Grip::Corner { left: true, top: true });
+        assert_eq!(grip_at(60, 18, 30, 9), Grip::Body);
+        assert_eq!(grip_at(60, 18, 3, 3), Grip::Corner { left: true, top: true });
         let places = [(true, true), (true, false), (false, true), (false, false)].map(|(l, t)| corner_cursor(l, t));
         assert_eq!({ let mut p = places; p.sort(); p }, [0, 1, 2, 3]);
     }
@@ -977,29 +1097,29 @@ mod tests {
             pointer: (1000, 1000),
             x: 400,
             y: 250,
-            width: 548,
+            width: 604,
             height: 180,
         };
         // The corner at the bottom right: the window stays where it is.
-        assert_eq!(corner(false, false).placement((1000, 1000), screen), (400, 250, 548));
-        assert_eq!(corner(false, false).placement((1274, 1000), screen), (400, 250, 822));
-        // 90 pixels taller is 274 wider.
-        assert_eq!(corner(false, false).placement((1000, 1090), screen), (400, 250, 822));
+        assert_eq!(corner(false, false).placement((1000, 1000), screen), (400, 250, 604));
+        assert_eq!(corner(false, false).placement((1302, 1000), screen), (400, 250, 906));
+        // 90 pixels taller is 302 wider.
+        assert_eq!(corner(false, false).placement((1000, 1090), screen), (400, 250, 906));
         // Of the two, the one that changes the size more.
-        assert_eq!(corner(false, false).placement((1100, 1090), screen), (400, 250, 822));
-        assert_eq!(corner(false, false).placement((900, 990), screen), (400, 250, 448));
-        assert_eq!(corner(false, false).placement((1000, 955), screen), (400, 250, 411));
-        // The corner at the top left: the bottom right one stays at 948,430.
-        let (x, y, width) = corner(true, true).placement((726, 1000), screen);
-        assert_eq!((x, y, width), (126, 160, 822));
-        assert_eq!((x + width, y + window_size(width as u32).1), (948, 430));
+        assert_eq!(corner(false, false).placement((1100, 1090), screen), (400, 250, 906));
+        assert_eq!(corner(false, false).placement((900, 990), screen), (400, 250, 504));
+        assert_eq!(corner(false, false).placement((1000, 955), screen), (400, 250, 453));
+        // The corner at the top left: the bottom right one stays at 1004,430.
+        let (x, y, width) = corner(true, true).placement((698, 1000), screen);
+        assert_eq!((x, y, width), (98, 160, 906));
+        assert_eq!((x + width, y + window_size(width as u32).1), (1004, 430));
         let (x, y, width) = corner(true, false).placement((1100, 1000), screen);
-        assert_eq!((x, y, width), (500, 250, 448));
+        assert_eq!((x, y, width), (500, 250, 504));
         // Within the sizes -width takes.
         assert_eq!(corner(false, false).placement((0, 0), screen).2, MIN_WIDTH as i32);
         assert_eq!(corner(false, false).placement((20000, 1000), screen).2, MAX_WIDTH as i32);
         let (x, y, width) = corner(true, true).placement((3000, 3000), screen);
-        assert_eq!((x + width, y + window_size(width as u32).1), (948, 430));
+        assert_eq!((x + width, y + window_size(width as u32).1), (1004, 430));
     }
 
     #[test]
@@ -1020,7 +1140,7 @@ mod tests {
             font: DEFAULT_FONT.to_string(),
         };
         // Nothing given, nothing saved.
-        assert_eq!(first_placement(&options(None, None), None, 2.0, screen), (1238, 90, 548));
+        assert_eq!(first_placement(&options(None, None), None, 2.0, screen), (1210, 90, 604));
         // What the pointer gave it the last time.
         assert_eq!(first_placement(&options(None, None), Some((100, 200, 411)), 2.0, screen), (100, 200, 411));
         // The options before it, each for what it names.
@@ -1028,6 +1148,6 @@ mod tests {
         assert_eq!(first_placement(&options(corner, None), Some((100, 200, 411)), 2.0, screen), (2573, 120, 411));
         assert_eq!(first_placement(&options(None, Some(300)), Some((100, 200, 411)), 2.0, screen), (100, 200, 300));
         // Saved on a larger screen.
-        assert_eq!(first_placement(&options(None, None), Some((2900, 1900, 548)), 2.0, screen), (2476, 1784, 548));
+        assert_eq!(first_placement(&options(None, None), Some((2900, 1900, 548)), 2.0, screen), (2476, 1801, 548));
     }
 }

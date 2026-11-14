@@ -6,14 +6,19 @@
 //! the pixels of that design: `x` runs from 0 to `WIDTH`, `y` from 0 to
 //! `HEIGHT`, and pixel `i` of the design covers `i..i + 1`. The picture is
 //! computed, not stored, so that it is as sharp at 2 times the size as at 1.
+//!
+//! The clock is wider than the design: the frame and the panel are the
+//! same at both ends, with `WIDER` more pixels of them in between, for the
+//! charge of the battery on the left of the time.
 
-pub const WIDTH: f64 = 274.0;
+const WIDER: f64 = 28.0;
+pub const WIDTH: f64 = 274.0 + WIDER;
 pub const HEIGHT: f64 = 90.0;
 
 /// The panel, inside the frame: `PANEL_LEFT..PANEL_RIGHT` by
 /// `PANEL_TOP..PANEL_BOTTOM`.
 pub const PANEL_LEFT: f64 = 15.0;
-pub const PANEL_RIGHT: f64 = 258.0;
+pub const PANEL_RIGHT: f64 = WIDTH - 16.0;
 const PANEL_TOP: f64 = 13.0;
 const PANEL_BOTTOM: f64 = 77.0;
 /// The frame ends in a lip above and below the panel.
@@ -246,8 +251,10 @@ pub fn render(width: usize, height: usize, samples: usize) -> Vec<[u8; 3]> {
 mod tests {
     use super::*;
 
-    /// The colour of pixel `x`, `y` of the design at its own size.
+    /// The colour of pixel `x`, `y` of the design at its own size: its
+    /// right half is `WIDER` further to the right in the picture.
     fn design(x: usize, y: usize) -> [u8; 3] {
+        let x = if x > 136 { x + WIDER as usize } else { x };
         color(x as f64 + 0.5, y as f64 + 0.5).map(|v| v.round() as u8)
     }
 
@@ -305,12 +312,15 @@ mod tests {
 
     #[test]
     fn rendered_sizes() {
-        let one = render(274, 90, 1);
-        assert_eq!(one.len(), 274 * 90);
-        assert_eq!(one[45 * 274 + 136], design(136, 45));
+        assert_eq!(WIDTH, 302.0);
+        let one = render(302, 90, 1);
+        assert_eq!(one.len(), 302 * 90);
+        assert_eq!(one[45 * 302 + 136], design(136, 45));
+        // The right end of the frame is the design's.
+        assert_eq!(one[45 * 302 + 300], design(272, 45));
         // Twice the size: the middle of the panel is the same colour.
-        let two = render(548, 180, 1);
-        assert!(near(two[90 * 548 + 272], 0x353f39, 2));
-        assert_eq!(render(137, 45, 3).len(), 137 * 45);
+        let two = render(604, 180, 1);
+        assert!(near(two[90 * 604 + 272], 0x353f39, 2));
+        assert_eq!(render(151, 45, 3).len(), 151 * 45);
     }
 }
