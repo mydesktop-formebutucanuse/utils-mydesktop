@@ -1,0 +1,10 @@
+[package]
+name = "ledclock"
+version = "0.1.0"
+description = "A clock on the desktop, drawn as a red LED display in a metal frame (X11)"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies: libX11 and libXft are called directly (src/xlib.rs).

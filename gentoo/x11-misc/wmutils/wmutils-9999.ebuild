@@ -6,7 +6,7 @@ EAPI=8
 RUST_MIN_VER="1.85.0"
 inherit cargo git-r3 toolchain-funcs udev
 
-DESCRIPTION="Window Maker desktop utilities: mediakeyd, autobrightd, scd, nsrun and dock apps"
+DESCRIPTION="Window Maker desktop utilities: mediakeyd, autobrightd, scd, ledclock, nsrun, dock apps"
 HOMEPAGE="https://github.com/mydesktop-formebutucanuse/wmutils"
 EGIT_REPO_URI="https://github.com/mydesktop-formebutucanuse/wmutils.git"
 
@@ -15,10 +15,12 @@ LICENSE="GPL-3+ GPL-2+"
 SLOT="0"
 
 # libdockapp, libXext, libXpm and libXrender: the dock apps
+# libXft: ledclock
 DEPEND="
 	>=x11-libs/libdockapp-0.7:=
 	x11-libs/libX11
 	x11-libs/libXext
+	x11-libs/libXft
 	x11-libs/libXi
 	x11-libs/libXpm
 	x11-libs/libXrender
@@ -56,7 +58,7 @@ src_compile() {
 }
 
 src_install() {
-	dobin "$(cargo_target_dir)"/{autobrightd,mediakeyd,scd}
+	dobin "$(cargo_target_dir)"/{autobrightd,ledclock,mediakeyd,scd}
 	# wmclock, wmacpi and wmacpi-cli, their man pages, and wmclock's day
 	# and month names in /usr/share/wmclock
 	emake -C dockapps DESTDIR="${D}" PREFIX="${EPREFIX}/usr" install
@@ -68,7 +70,7 @@ src_install() {
 
 	dodoc README.md
 	local tool
-	for tool in autobrightd backlight dockapps kernel mediakeyd nsrun scd; do
+	for tool in autobrightd backlight dockapps kernel ledclock mediakeyd nsrun scd; do
 		docinto "${tool}"
 		dodoc "${tool}"/README.md
 	done
@@ -91,6 +93,9 @@ pkg_postinst() {
 	elog "The dock apps are wmclock and wmacpi; start the battery one as"
 	elog "  wmacpi -f"
 	elog "and drag both into the Dock: /usr/share/doc/${PF}/dockapps/README.md*."
+	elog "ledclock is a clock on the desktop: start it with the session"
+	elog "  ledclock &"
+	elog "and drag it to its place, or a corner of it to its size."
 	elog "nsrun -x needs the X server started through nsrun-xserver: see"
 	elog "/usr/share/doc/${PF}/nsrun/README.md*."
 	elog "The kernel patches are not part of this package: see"

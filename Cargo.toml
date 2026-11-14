@@ -1,5 +1,5 @@
 [workspace]
-members = ["autobrightd", "mediakeyd", "scd"]
+members = ["autobrightd", "ledclock", "mediakeyd", "scd"]
 resolver = "3"
 
 [workspace.package]
